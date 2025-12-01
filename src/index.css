@@ -1,0 +1,30 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Custom base layer tweaks */
+@layer base {
+  body { @apply bg-gray-50 text-gray-900 font-sans; }
+  h1,h2,h3,h4 { @apply font-semibold tracking-tight; }
+}
+
+@layer components {
+  .card { @apply bg-white rounded-xl shadow border border-gray-200; }
+  .btn-primary { @apply inline-flex items-center justify-center px-4 py-2 rounded-lg bg-indigo-600 text-white font-medium hover:bg-indigo-700 transition; }
+  .btn-disabled { @apply opacity-60 cursor-not-allowed; }
+}
+
+/* Lightweight animations */
+@keyframes fade-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@keyframes slide-down {
+  from { opacity: 0; transform: translateY(-6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@layer utilities {
+  .animate-fade-in { animation: fade-in .25s ease-out both; }
+  .animate-slide-down { animation: slide-down .22s ease-out both; }
+}
