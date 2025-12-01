@@ -1,6 +1,33 @@
+// Lightweight error boundary to prevent chart crashes blanking the app
+function ChartErrorBoundary({ children }: { children: React.ReactNode }) {
+  const [error, setError] = React.useState<Error | null>(null);
+  const reset = () => setError(null);
+  // Minimal class-based boundary via inline component
+  const Boundary = React.useMemo(() => {
+    return class Boundary extends React.Component<{ onError: (e: Error)=>void; children: React.ReactNode }> {
+      componentDidCatch(err: Error) { this.props.onError(err); }
+      render() { return this.props.children; }
+    };
+  }, []);
+  if (error) {
+    return (
+      <div className="p-6 text-center">
+        <div className="inline-block rounded-md border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+          Chart failed to render. Try again.
+        </div>
+        <div className="mt-3">
+          <button onClick={reset} className="px-3 py-1.5 rounded-md bg-indigo-600 text-white text-sm">Reload Chart</button>
+        </div>
+      </div>
+    );
+  }
+  // @ts-ignore JSX runtime class component usage
+  return <Boundary onError={setError}>{children}</Boundary>;
+}
 import React, { useState, useMemo, useCallback, useEffect } from 'react';
-import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
+import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, PieChart, Pie, Cell, Legend, ResponsiveContainer } from 'recharts';
 import { DollarSign, TrendingUp, BarChart as BarChartIcon, Clock, PlusSquare, Settings, Store, CreditCard, Search, ChevronDown, List, Plus, User, Trash, Pencil, CheckCircle2, XCircle } from 'lucide-react';
+// (merged into single import above)
 import { initializeApp } from 'firebase/app';
 import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
 import { getFirestore, doc, setDoc, updateDoc, collection, onSnapshot, increment, deleteDoc, query, where, getDocs, writeBatch } from 'firebase/firestore';
@@ -46,7 +73,7 @@ interface KpiData {
   trend: 'up' | 'down';
 }
 
-type View = 'stores' | 'addStore' | 'payments' | 'settings';
+type View = 'stores' | 'addStore' | 'payments' | 'settings' | 'visual';
 
 const formatNaira = (amount: number, formatType: 'full' | 'short') => {
   if (formatType === 'full') {
@@ -410,19 +437,15 @@ const StoresListView: React.FC<{ stores: StoreData[]; db?: any; isAuthReady?: bo
   const [searchText, setSearchText] = useState('');
   const [expandedStoreId, setExpandedStoreId] = useState<string | null>(null);
   const [filterMonth, setFilterMonth] = useState('all');
-  // Static month list (Jan-Dec) without year
   const MONTH_OPTIONS = MONTH_ONLY_OPTIONS;
 
-  // Expand a location after adding a store (e.g., "Quick Entry")
   useEffect(() => {
     const toExpand = localStorage.getItem('expand_location');
     if (toExpand) {
-      // No-op for store-level view; kept for backward compatibility
       localStorage.removeItem('expand_location');
     }
   }, []);
 
-  // Expand a specific store after adding
   useEffect(() => {
     const storeId = localStorage.getItem('expand_store_id');
     if (storeId) {
@@ -440,7 +463,6 @@ const StoresListView: React.FC<{ stores: StoreData[]; db?: any; isAuthReady?: bo
     );
   }, [searchText, stores]);
 
-  // Apply month filter to transactions per store
   const monthFilteredTxByStore = useMemo(() => {
     if (!transactionsByStore) return {} as Record<string, Transaction[]>;
     if (filterMonth === 'all') return transactionsByStore;
@@ -457,7 +479,6 @@ const StoresListView: React.FC<{ stores: StoreData[]; db?: any; isAuthReady?: bo
     const ok = window.confirm(`Delete store "${store.name}"? This cannot be undone.`);
     if (!ok) return;
     try {
-      // If this is a locally pending store, remove it from localStorage
       const isLocal = store.id.startsWith('local-');
       if (isLocal) {
         const raw = localStorage.getItem('pending_stores');
@@ -467,12 +488,11 @@ const StoresListView: React.FC<{ stores: StoreData[]; db?: any; isAuthReady?: bo
         window.dispatchEvent(new Event('pendingStoresUpdated'));
         return;
       }
-      // Remote deletion via Firestore
       if (db && isAuthReady && appId) {
         const storeRef = doc(db, 'artifacts', appId, 'public', 'data', 'stores', store.id);
         await deleteDoc(storeRef);
       } else {
-        alert('Database not connected yet; cannot delete remote store.');
+        alert('Failed to delete store. See console for details.');
       }
     } catch (err) {
       console.error('Failed to delete store:', err);
@@ -499,15 +519,13 @@ const StoresListView: React.FC<{ stores: StoreData[]; db?: any; isAuthReady?: bo
         const storeRef = doc(db, 'artifacts', appId, 'public', 'data', 'stores', store.id);
         await updateDoc(storeRef, { location: trimmed });
       } else {
-        alert('Database not connected yet; cannot update location.');
+        alert('Database not connected. Cannot update location now.');
       }
     } catch (err) {
       console.error('Failed to update location:', err);
       alert('Failed to update location. See console for details.');
     }
   };
-
-  // Removed prompt-based edit handler; inline editing handled inside StoreAccordion
 
   return (
     <div className="p-4 sm:p-8">
@@ -664,6 +682,172 @@ const AddStoreView: React.FC<{ db: any; isAuthReady: boolean; setView: (view: Vi
 };
 
 const StoresDashboardView: React.FC<{ stores: StoreData[]; db?: any; isAuthReady?: boolean; appId?: string; transactionsByStore?: Record<string, Transaction[]> }> = ({ stores, db, isAuthReady, appId, transactionsByStore }) => <StoresListView stores={stores} db={db} isAuthReady={isAuthReady} appId={appId} transactionsByStore={transactionsByStore} />;
+
+const VisualView: React.FC<{ stores: StoreData[]; transactionsByStore: Record<string, Transaction[]> }> = ({ stores, transactionsByStore }) => {
+  const [chartType, setChartType] = useState<'pie'|'donut'|'bar'>('pie');
+  const [monthFilter, setMonthFilter] = useState<string>('all');
+  const [topN, setTopN] = useState<number>(10);
+  const MONTH_OPTIONS = MONTH_ONLY_OPTIONS;
+
+  const { data, leastData } = useMemo(() => {
+    const out: { name: string; value: number }[] = [];
+    for (const s of stores) {
+      let tx = transactionsByStore[s.id] || [];
+      if (monthFilter !== 'all') {
+        tx = tx.filter(t => t.transactionMonth === monthFilter);
+      }
+      const sum = tx.reduce((acc, t) => acc + (typeof t.paymentAmount === 'number' ? t.paymentAmount : 0), 0);
+      out.push({ name: s.name, value: sum });
+    }
+    out.sort((a,b)=> b.value - a.value);
+    const top = out.slice(0, topN);
+    const least = out.slice(-topN).reverse();
+    return { data: top, leastData: least };
+  }, [stores, transactionsByStore, monthFilter, topN]);
+
+  const total = data.reduce((a,b)=> a + b.value, 0) || 1;
+
+  return (
+    <div className="p-8">
+      <header className="mb-6">
+        <h1 className="text-3xl font-extrabold text-gray-900 border-b pb-2 border-indigo-100 flex items-center">
+          <BarChartIcon className="w-7 h-7 mr-3 text-indigo-600" />
+          View Visual
+        </h1>
+        <p className="text-gray-500 mt-1">Top stores by revenue. Switch chart types.</p>
+      </header>
+      <div className="bg-white p-4 rounded-xl shadow-lg border border-gray-100 mb-6 flex flex-wrap items-center gap-3">
+        <span className="text-sm text-gray-600">Chart type</span>
+        <div className="inline-flex rounded-md shadow-sm overflow-hidden">
+          <button onClick={()=>setChartType('pie')} className={`px-3 py-1 text-sm ${chartType==='pie'?'bg-indigo-600 text-white':'bg-gray-100 text-gray-700 hover:bg-gray-200'}`}>Pie</button>
+          <button onClick={()=>setChartType('donut')} className={`px-3 py-1 text-sm ${chartType==='donut'?'bg-indigo-600 text-white':'bg-gray-100 text-gray-700 hover:bg-gray-200'}`}>Donut</button>
+          <button onClick={()=>setChartType('bar')} className={`px-3 py-1 text-sm ${chartType==='bar'?'bg-indigo-600 text-white':'bg-gray-100 text-gray-700 hover:bg-gray-200'}`}>Bar</button>
+        </div>
+        <div className="ml-auto flex items-center gap-3">
+          <label className="text-sm text-gray-600">Month</label>
+          <select value={monthFilter} onChange={(e)=> setMonthFilter(e.target.value)} className="px-3 py-1 border rounded-md text-sm">
+            <option value="all">All</option>
+            {MONTH_OPTIONS.map(m => (
+              <option key={m.value} value={m.value}>{m.label}</option>
+            ))}
+          </select>
+          <label className="text-sm text-gray-600">Top</label>
+          <select value={topN} onChange={(e)=> setTopN(parseInt(e.target.value,10))} className="px-3 py-1 border rounded-md text-sm">
+            {[5,10,15,20].map(n => (<option key={n} value={n}>{n}</option>))}
+          </select>
+        </div>
+      </div>
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        <div className="lg:col-span-2 bg-white p-6 rounded-xl shadow-lg border border-gray-100">
+          {data.length === 0 ? (
+            <div className="text-center text-gray-500">No revenue data available.</div>
+          ) : chartType === 'bar' ? (
+            <ResponsiveContainer width="100%" height={380}>
+              <BarChart data={data} margin={{ top: 10, right: 10, left: -20, bottom: 40 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
+                <XAxis
+                  dataKey="name"
+                  tick={{ fill: '#6b7280', fontSize: 12 }}
+                  interval={0}
+                  angle={-20}
+                  dy={24}
+                  tickFormatter={(name: string) => name.length > 18 ? name.slice(0, 18) + '…' : name}
+                />
+                <YAxis tick={{ fill: '#6b7280' }} tickFormatter={(v)=> formatNaira(Number(v),'short')} />
+                <Tooltip contentStyle={{ backgroundColor: '#fff', border: '1px solid #e5e7eb', borderRadius: 8 }} formatter={(v:any, _name:any, props:any)=> [formatNaira(Number(v),'full'), props?.payload?.name || 'Revenue'] } />
+                <Legend verticalAlign="bottom" wrapperStyle={{ color: '#374151' }} />
+                <Bar dataKey="value" maxBarSize={56} radius={[6,6,0,0]}>
+                  <LabelList
+                    dataKey="value"
+                    position="top"
+                    content={(props: any) => {
+                      const n = typeof props.value === 'number' ? props.value : Number(props.value ?? 0);
+                      if (!isFinite(n) || n <= 0) return null;
+                      const x = props.x as number;
+                      const y = props.y as number;
+                      return (
+                        <text x={x} y={y} dy={-6} textAnchor="middle" fill="#374151" fontSize={12}>
+                          {formatNaira(n,'short')}
+                        </text>
+                      );
+                    }}
+                  />
+                  {data.map((_d, i) => (
+                    <Cell key={`bar-${i}`} fill={["#4f46e5","#22c55e","#ef4444","#f59e0b","#06b6d4","#a855f7","#64748b","#14b8a6","#f97316","#84cc16"][i % 10]} />
+                  ))}
+                </Bar>
+              </BarChart>
+            </ResponsiveContainer>
+          ) : (
+            <ResponsiveContainer width="100%" height={400}>
+              <PieChart>
+                <Pie
+                  data={data}
+                  dataKey="value"
+                  nameKey="name"
+                  cx="50%"
+                  cy="50%"
+                  outerRadius={chartType==='donut' ? 140 : 160}
+                  innerRadius={chartType==='donut' ? 80 : 0}
+                  paddingAngle={2}
+                  labelLine
+                  label={({ name, percent }: { name: string; percent: number }) => {
+                    const pct = Math.round(percent * 100);
+                    if (pct < 4) return '';
+                    const shortName = name.length > 20 ? name.slice(0, 20) + '…' : name;
+                    return `${shortName} (${pct}%)`;
+                  }}
+                >
+                  {data.map((entry, index) => (
+                    <Cell key={`cell-${index}`} fill={["#4f46e5","#22c55e","#ef4444","#f59e0b","#06b6d4","#a855f7","#64748b","#14b8a6","#f97316","#84cc16"][index % 10]} />
+                  ))}
+                </Pie>
+                <Tooltip contentStyle={{ backgroundColor: '#fff', border: '1px solid #e5e7eb', borderRadius: 8 }} formatter={(v:any, _name:any, props:any)=> [formatNaira(Number(v),'full'), props?.payload?.name || 'Revenue'] } />
+                <Legend verticalAlign="bottom" wrapperStyle={{ color: '#374151' }} />
+              </PieChart>
+            </ResponsiveContainer>
+          )}
+        </div>
+        <div className="space-y-6">
+          <div className="bg-white p-6 rounded-xl shadow-lg border border-gray-100">
+            <h3 className="text-lg font-semibold text-gray-800 mb-3 flex items-center gap-2">
+              <span>Top Stores {monthFilter!=='all' ? `(${monthFilter})` : ''}</span>
+              <TrendingUp className="w-4 h-4 text-green-600" />
+            </h3>
+            <ul className="space-y-2">
+              {data.map((d, i) => (
+                <li key={`top-${i}`} className="flex items-center justify-between text-sm">
+                  <span className="text-gray-700 truncate max-w-[60%]">{i+1}. {d.name}</span>
+                  <span className="inline-flex items-center gap-2">
+                    <span className="px-2 py-0.5 rounded-full bg-green-50 text-green-700 text-xs">Revenue</span>
+                    <span className="font-semibold text-green-700">{formatNaira(d.value,'full')}</span>
+                  </span>
+                </li>
+              ))}
+            </ul>
+          </div>
+          <div className="bg-white p-6 rounded-xl shadow-lg border border-gray-100">
+            <h3 className="text-lg font-semibold text-gray-800 mb-3 flex items-center gap-2">
+              <span>Least Stores {monthFilter!=='all' ? `(${monthFilter})` : ''}</span>
+              <TrendingUp className="w-4 h-4 text-red-600 rotate-180" />
+            </h3>
+            <ul className="space-y-2">
+              {leastData.map((d, i) => (
+                <li key={`least-${i}`} className="flex items-center justify-between text-sm">
+                  <span className="text-gray-700 truncate max-w-[60%]">{i+1}. {d.name}</span>
+                  <span className="inline-flex items-center gap-2">
+                    <span className="px-2 py-0.5 rounded-full bg-red-50 text-red-700 text-xs">Revenue</span>
+                    <span className="font-semibold text-red-700">{formatNaira(d.value,'full')}</span>
+                  </span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
 
 const AddPaymentsView: React.FC<{ stores: StoreData[]; db: any; isAuthReady: boolean; setView: (view: View) => void }> = ({ stores, db, isAuthReady }) => {
   const currentMonthName = MONTH_NAMES[new Date().getMonth()];
@@ -927,25 +1111,19 @@ const SettingsView: React.FC<{ db?: any; isAuthReady?: boolean; appId?: string; 
     if (!file) return;
     resetImport();
     setFileInfo(`${file.name} (${Math.round(file.size/1024)} KB)`);
-    const isCSV = file.name.toLowerCase().endsWith('.csv');
     const isXLSX = file.name.toLowerCase().endsWith('.xlsx') || file.name.toLowerCase().endsWith('.xls');
-    if (!isCSV && !isXLSX) {
-      setImportReport(r => ({ ...r, errors: [...r.errors, 'Unsupported file type. Use CSV or XLSX.'] }));
+    if (!isXLSX) {
+      setImportReport(r => ({ ...r, errors: [...r.errors, 'Unsupported file type. Upload an Excel file (.xlsx or .xls) with a single column of store names.'] }));
       return;
     }
     try {
-      if (isCSV) {
-        const text = await file.text();
-        parseCsv(text);
-      } else if (isXLSX) {
-        const data = await file.arrayBuffer();
-        const XLSX = await import('xlsx');
-        const wb = XLSX.read(data, { type: 'array' });
-        const sheetName = wb.SheetNames[0];
-        const sheet = wb.Sheets[sheetName];
-        const json: any[] = XLSX.utils.sheet_to_json(sheet, { defval: '' });
-        processJsonRows(json);
-      }
+      const data = await file.arrayBuffer();
+      const XLSX = await import('xlsx');
+      const wb = XLSX.read(data, { type: 'array' });
+      const sheetName = wb.SheetNames[0];
+      const sheet = wb.Sheets[sheetName];
+      const json: any[] = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '' });
+      processExcelNameList(json);
     } catch (err: any) {
       console.error('Import parse error:', err);
       setImportReport(r => ({ ...r, errors: [...r.errors, 'Failed to parse file.'] }));
@@ -954,46 +1132,19 @@ const SettingsView: React.FC<{ db?: any; isAuthReady?: boolean; appId?: string; 
 
   const normalizeHeader = (h: string) => h.trim().toLowerCase().replace(/\s+/g, '');
 
-  const processJsonRows = (rows: any[]) => {
+  const processExcelNameList = (rows: any[]) => {
+    // rows is a 2D array from header:1 — treat first non-empty cell per row as the store name
     const out: ImportedStoreRow[] = [];
     for (const r of rows) {
-      const entries = Object.entries(r).reduce<Record<string,string>>((acc,[k,v])=>{acc[normalizeHeader(k)] = String(v).trim(); return acc;}, {});
-      const name = entries['name'] || entries['storename'] || '';
-      if (!name) continue; // skip unnamed
-      out.push({
-        name,
-        owner: entries['owner'] || 'N/A (Imported)',
-        email: entries['email'] || '',
-        location: entries['location'] || 'Imported'
-      });
+      if (!Array.isArray(r)) continue;
+      const first = (r[0] ?? '').toString().trim();
+      if (!first || first.toLowerCase() === 'name') continue;
+      out.push({ name: first });
     }
     setParsedRows(out);
   };
 
-  const parseCsv = (text: string) => {
-    const lines = text.split(/\r?\n/).filter(l => l.trim().length > 0);
-    if (lines.length === 0) return;
-    const header = lines[0].split(',').map(h => normalizeHeader(h));
-    const idx = {
-      name: header.findIndex(h => ['name','storename'].includes(h)),
-      owner: header.findIndex(h => h === 'owner'),
-      email: header.findIndex(h => h === 'email'),
-      location: header.findIndex(h => h === 'location')
-    };
-    const rows: ImportedStoreRow[] = [];
-    for (let i=1;i<lines.length;i++) {
-      const cols = lines[i].split(',');
-      const rawName = idx.name >= 0 ? cols[idx.name].trim() : '';
-      if (!rawName) continue;
-      rows.push({
-        name: rawName,
-        owner: idx.owner >= 0 ? cols[idx.owner].trim() : 'N/A (Imported)',
-        email: idx.email >= 0 ? cols[idx.email].trim() : '',
-        location: idx.location >= 0 ? cols[idx.location].trim() : 'Imported'
-      });
-    }
-    setParsedRows(rows);
-  };
+  // CSV import removed per requirement — only Excel name lists are allowed
 
   const performImport = async () => {
     if (!parsedRows.length) return;
@@ -1044,7 +1195,7 @@ const SettingsView: React.FC<{ db?: any; isAuthReady?: boolean; appId?: string; 
     }
   };
 
-  const sampleCsv = 'Name,Owner,Email,Location\nAlpha Store,John Doe,alpha@example.com,Lagos\nBeta Hub,Jane Roe,beta@example.com,Abuja';
+  const sampleCsv = '';
 
   const collectMonthData = async (month: string) => {
     const storeMap: Record<string, StoreData> = {};
@@ -1267,9 +1418,9 @@ const SettingsView: React.FC<{ db?: any; isAuthReady?: boolean; appId?: string; 
       {importOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
           <div className="bg-white rounded-xl shadow-lg border border-gray-200 w-[95%] max-w-lg p-6">
-            <h3 className="text-lg font-semibold text-gray-900 mb-3">Import Stores (CSV / XLSX)</h3>
-            <p className="text-sm text-gray-600 mb-4">Upload a spreadsheet with columns: Name, Owner, Email, Location.</p>
-            <input type="file" accept=".csv,.xlsx,.xls" onChange={handleFile} className="block w-full text-sm text-gray-700 file:mr-4 file:py-2 file:px-4 file:rounded-md file:border-0 file:text-sm file:font-semibold file:bg-purple-50 file:text-purple-700 hover:file:bg-purple-100" />
+            <h3 className="text-lg font-semibold text-gray-900 mb-3">Import Stores (Excel)</h3>
+            <p className="text-sm text-gray-600 mb-4">Upload an Excel sheet (.xlsx or .xls) with a single column of store names.</p>
+            <input type="file" accept=".xlsx,.xls" onChange={handleFile} className="block w-full text-sm text-gray-700 file:mr-4 file:py-2 file:px-4 file:rounded-md file:border-0 file:text-sm file:font-semibold file:bg-purple-50 file:text-purple-700 hover:file:bg-purple-100" />
             {fileInfo && <p className="mt-2 text-xs text-gray-500">Loaded: {fileInfo}</p>}
             {parsedRows.length > 0 && (
               <div className="mt-3 p-3 rounded-md bg-gray-50 border text-xs text-gray-700">
@@ -1288,12 +1439,9 @@ const SettingsView: React.FC<{ db?: any; isAuthReady?: boolean; appId?: string; 
             <div className="mt-4 flex items-center justify-end gap-3">
               <button onClick={() => setImportOpen(false)} className="px-4 py-2 rounded-md bg-gray-200 text-gray-700 hover:bg-gray-300">Close</button>
               <button type="button" onClick={() => {
-                const blob = new Blob([sampleCsv], { type: 'text/csv' });
-                const url = URL.createObjectURL(blob);
-                const a = document.createElement('a');
-                a.href = url; a.download = 'stores-sample.csv'; a.click();
-                URL.revokeObjectURL(url);
-              }} className="px-4 py-2 rounded-md bg-green-600 text-white hover:bg-green-700">Sample CSV</button>
+                // Generate a tiny Excel file client-side is complex; provide guidance instead
+                alert('Prepare an Excel sheet with a single column titled "Name" and list store names under it.');
+              }} className="px-4 py-2 rounded-md bg-green-600 text-white hover:bg-green-700">Excel Format Guide</button>
               <button disabled={!parsedRows.length || importing} onClick={performImport} className={`px-4 py-2 rounded-md text-white ${importing? 'bg-purple-400':'bg-purple-600 hover:bg-purple-700'} disabled:opacity-50`}>{importing? 'Importing...' : 'Import'}</button>
             </div>
           </div>
@@ -1306,12 +1454,14 @@ const SettingsView: React.FC<{ db?: any; isAuthReady?: boolean; appId?: string; 
 const Sidebar: React.FC<{ currentView: View; setView: (view: View) => void }> = ({ currentView, setView }) => {
   const navItems = [
     { id: 'stores' as View, label: 'View Stores', icon: List },
+    { id: 'visual' as View, label: 'View Visual', icon: BarChartIcon },
     { id: 'addStore' as View, label: 'Add Store', icon: Plus },
     { id: 'payments' as View, label: 'Add Payments', icon: CreditCard },
     { id: 'settings' as View, label: 'Settings', icon: Settings }
   ];
   const colorMap: Record<View, { hover: string; active: string }> = {
     stores:   { hover: 'hover:bg-blue-600 hover:text-white',   active: 'bg-blue-600 text-white' },
+    visual:   { hover: 'hover:bg-indigo-600 hover:text-white', active: 'bg-indigo-600 text-white' },
     addStore: { hover: 'hover:bg-red-600 hover:text-white',    active: 'bg-red-600 text-white' },
     payments: { hover: 'hover:bg-green-600 hover:text-white',  active: 'bg-green-600 text-white' },
     settings: { hover: 'hover:bg-purple-600 hover:text-white', active: 'bg-purple-600 text-white' }
@@ -1686,6 +1836,8 @@ const App: React.FC = () => {
     switch (currentView) {
       case 'stores':
         return <StoresDashboardView stores={displayStores} db={db} isAuthReady={isAuthReady} appId={appId} transactionsByStore={transactionsByStore} />;
+      case 'visual':
+        return <VisualView stores={displayStores} transactionsByStore={transactionsByStore} />;
       case 'addStore':
         return <AddStoreView db={db} isAuthReady={isAuthReady} setView={setCurrentView} />;
       case 'payments':
