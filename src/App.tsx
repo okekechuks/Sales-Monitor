@@ -389,7 +389,7 @@ const StoreAccordion: React.FC<{ store: StoreData; isExpanded: boolean; onToggle
                           </div>
                         </div>
                         <div className="flex items-center gap-3">
-                          <div className={`font-semibold ${t.clearance === 'NOT_CLEARED' ? 'text-red-600' : 'text-green-700'}`}>{formatNaira(t.paymentAmount, 'full')}</div>
+                          <div className={`font-semibold text-green-700`}>{formatNaira(t.paymentAmount, 'full')}</div>
                           <button onClick={() => startEdit(t)} className="px-2 py-1 text-xs rounded-md bg-indigo-100 text-indigo-700 hover:bg-indigo-200 transition">Edit</button>
                           <button onClick={() => deleteTransaction(t)} className="px-2 py-1 text-xs rounded-md bg-red-100 text-red-700 hover:bg-red-200 transition">Delete</button>
                         </div>
