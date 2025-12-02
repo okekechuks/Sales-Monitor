@@ -1,3 +1,10 @@
+import React, { useState, useMemo, useCallback, useEffect } from 'react';
+import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, PieChart, Pie, Cell, Legend, ResponsiveContainer } from 'recharts';
+import { DollarSign, TrendingUp, BarChart as BarChartIcon, Clock, PlusSquare, Settings, Store, CreditCard, Search, ChevronDown, List, Plus, User, Trash, Pencil, CheckCircle2, XCircle, AlertTriangle } from 'lucide-react';
+// (merged into single import above)
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
+import { getFirestore, doc, setDoc, updateDoc, collection, onSnapshot, increment, deleteDoc, query, where, getDocs, writeBatch } from 'firebase/firestore';
 // Lightweight error boundary to prevent chart crashes blanking the app
 function ChartErrorBoundary({ children }: { children: React.ReactNode }) {
   const [error, setError] = React.useState<Error | null>(null);
@@ -24,13 +31,6 @@ function ChartErrorBoundary({ children }: { children: React.ReactNode }) {
   // @ts-ignore JSX runtime class component usage
   return <Boundary onError={setError}>{children}</Boundary>;
 }
-import React, { useState, useMemo, useCallback, useEffect } from 'react';
-import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, PieChart, Pie, Cell, Legend, ResponsiveContainer } from 'recharts';
-import { DollarSign, TrendingUp, BarChart as BarChartIcon, Clock, PlusSquare, Settings, Store, CreditCard, Search, ChevronDown, List, Plus, User, Trash, Pencil, CheckCircle2, XCircle } from 'lucide-react';
-// (merged into single import above)
-import { initializeApp } from 'firebase/app';
-import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
-import { getFirestore, doc, setDoc, updateDoc, collection, onSnapshot, increment, deleteDoc, query, where, getDocs, writeBatch } from 'firebase/firestore';
 
 const MONTH_NAMES = [
   'January', 'February', 'March', 'April', 'May', 'June',
@@ -46,6 +46,7 @@ interface Transaction {
   storeId: string;
   senderName: string;
   simCardsSold: number;
+  faultySims?: number;
   paymentAmount: number;
   status: 'Completed' | 'Pending' | 'Canceled';
   createdAt: string;
@@ -148,11 +149,11 @@ const StoreDetailRow: React.FC<{ store: StoreData; onDelete: (store: StoreData) 
 const StoreAccordion: React.FC<{ store: StoreData; isExpanded: boolean; onToggle: () => void; onDelete: (store: StoreData) => void; onEditLocation: (store: StoreData) => void; transactions?: Transaction[]; db?: any; isAuthReady?: boolean; appId?: string }> = ({ store, isExpanded, onToggle, onDelete, onEditLocation, transactions = [], db, isAuthReady, appId }) => {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [localTx, setLocalTx] = useState<Transaction[]>(transactions);
-  const [editFields, setEditFields] = useState<{ senderName: string; simCardsSold: string; paymentAmount: string; clearance: 'CLEARED' | 'NOT_CLEARED' }>(
-    { senderName: '', simCardsSold: '', paymentAmount: '', clearance: 'NOT_CLEARED' }
+  const [editFields, setEditFields] = useState<{ senderName: string; simCardsSold: string; faultySims: string; paymentAmount: string; clearance: 'CLEARED' | 'NOT_CLEARED' }>(
+    { senderName: '', simCardsSold: '', faultySims: '', paymentAmount: '', clearance: 'NOT_CLEARED' }
   );
   const [saving, setSaving] = useState(false);
-  const savedEditsRef = React.useRef<Record<string, { senderName: string; simCardsSold: number; paymentAmount: number; clearance?: 'CLEARED' | 'NOT_CLEARED' }>>({});
+  const savedEditsRef = React.useRef<Record<string, { senderName: string; simCardsSold: number; faultySims?: number; paymentAmount: number; clearance?: 'CLEARED' | 'NOT_CLEARED' }>>({});
   // Always derive revenue from current transaction list (includes pending & optimistic edits)
   const computedRevenue = useMemo(() => {
     return localTx.reduce((sum, t) => sum + (typeof t.paymentAmount === 'number' ? t.paymentAmount : 0), 0);
@@ -236,7 +237,7 @@ const StoreAccordion: React.FC<{ store: StoreData; isExpanded: boolean; onToggle
         const override = savedEditsRef.current[editingId];
         const merged = override ? { ...updated, ...override } : updated;
         setLocalTx(prev => prev.map(p => p.id === editingId ? merged : p));
-        setEditFields({ senderName: merged.senderName, simCardsSold: String(merged.simCardsSold), paymentAmount: String(merged.paymentAmount), clearance: (merged.clearance || 'NOT_CLEARED') as 'CLEARED' | 'NOT_CLEARED' });
+        setEditFields({ senderName: merged.senderName, simCardsSold: String(merged.simCardsSold), faultySims: String(merged.faultySims ?? ''), paymentAmount: String(merged.paymentAmount), clearance: (merged.clearance || 'NOT_CLEARED') as 'CLEARED' | 'NOT_CLEARED' });
       }
       return;
     }
@@ -254,7 +255,7 @@ const StoreAccordion: React.FC<{ store: StoreData; isExpanded: boolean; onToggle
       }
     });
   }, [transactions, editingId]);
-  const startEdit = (t: Transaction) => { setEditingId(t.id); setEditFields({ senderName: t.senderName, simCardsSold: String(t.simCardsSold), paymentAmount: String(t.paymentAmount), clearance: (t.clearance || 'NOT_CLEARED') as 'CLEARED' | 'NOT_CLEARED' }); };
+  const startEdit = (t: Transaction) => { setEditingId(t.id); setEditFields({ senderName: t.senderName, simCardsSold: String(t.simCardsSold), faultySims: String(t.faultySims ?? ''), paymentAmount: String(t.paymentAmount), clearance: (t.clearance || 'NOT_CLEARED') as 'CLEARED' | 'NOT_CLEARED' }); };
   const cancelEdit = () => { setEditingId(null); setSaving(false); };
   const saveEdit = async () => {
     if (!editingId) return;
@@ -263,8 +264,9 @@ const StoreAccordion: React.FC<{ store: StoreData; isExpanded: boolean; onToggle
     const senderName = editFields.senderName.trim();
     const simCardsSold = parseInt(editFields.simCardsSold, 10);
     const paymentAmount = parseFloat(editFields.paymentAmount);
+    const faultySims = editFields.faultySims.trim() === '' ? undefined : parseInt(editFields.faultySims, 10);
     const clearance = editFields.clearance;
-    if (!senderName || isNaN(simCardsSold) || simCardsSold < 0 || isNaN(paymentAmount) || paymentAmount < 0) { alert('Invalid values'); return; }
+    if (!senderName || isNaN(simCardsSold) || simCardsSold < 0 || isNaN(paymentAmount) || paymentAmount < 0 || (faultySims !== undefined && (isNaN(faultySims) || faultySims < 0))) { alert('Invalid values'); return; }
     // Offline or DB not ready: queue edit into pending_payments (will sync later)
     if (!db || !isAuthReady || !appId) {
       try {
@@ -273,8 +275,8 @@ const StoreAccordion: React.FC<{ store: StoreData; isExpanded: boolean; onToggle
         let arr = Array.isArray(list) ? list : [];
         // Find existing pending entry by id OR by unique (storeId + transactionMonth)
         const idx = arr.findIndex((p: any) => p.id === tx.id || (p.storeId === tx.storeId && p.transactionMonth === tx.transactionMonth));
-        const updated = { ...tx, senderName, simCardsSold, paymentAmount, clearance };
-        if (idx >= 0) arr[idx] = { ...arr[idx], senderName, simCardsSold, paymentAmount, clearance };
+        const updated = { ...tx, senderName, simCardsSold, faultySims, paymentAmount, clearance };
+        if (idx >= 0) arr[idx] = { ...arr[idx], senderName, simCardsSold, faultySims, paymentAmount, clearance };
         else arr.push(updated);
         localStorage.setItem('pending_payments', JSON.stringify(arr));
         // Optimistically adjust store revenue locally so UI reflects change immediately
@@ -288,12 +290,12 @@ const StoreAccordion: React.FC<{ store: StoreData; isExpanded: boolean; onToggle
           console.warn('Failed local revenue adjust (offline edit):', revErr);
         }
         // Persist override until snapshot reflects
-        savedEditsRef.current[tx.id] = { senderName, simCardsSold, paymentAmount, clearance };
+        savedEditsRef.current[tx.id] = { senderName, simCardsSold, faultySims, paymentAmount, clearance };
         const overridesRaw = localStorage.getItem('edit_overrides');
         const overrides = overridesRaw ? JSON.parse(overridesRaw) : {};
-        overrides[tx.id] = { senderName, simCardsSold, paymentAmount, clearance };
+        overrides[tx.id] = { senderName, simCardsSold, faultySims, paymentAmount, clearance };
         localStorage.setItem('edit_overrides', JSON.stringify(overrides));
-        setLocalTx(prev => prev.map(p => p.id === tx.id ? { ...p, senderName, simCardsSold, paymentAmount, clearance } : p));
+        setLocalTx(prev => prev.map(p => p.id === tx.id ? { ...p, senderName, simCardsSold, faultySims, paymentAmount, clearance } : p));
         window.dispatchEvent(new Event('pendingPaymentsUpdated'));
         cancelEdit();
       } catch (offlineErr) {
@@ -305,21 +307,23 @@ const StoreAccordion: React.FC<{ store: StoreData; isExpanded: boolean; onToggle
     setSaving(true);
     try {
       const txRef = doc(db, 'artifacts', appId, 'public', 'data', 'transactions', tx.id);
-      await updateDoc(txRef, { senderName, simCardsSold, paymentAmount, clearance });
+      const updatePayload: any = { senderName, simCardsSold, paymentAmount, clearance };
+      if (faultySims !== undefined) updatePayload.faultySims = faultySims;
+      await updateDoc(txRef, updatePayload);
       const delta = paymentAmount - tx.paymentAmount;
       if (delta !== 0) {
         const storeRef = doc(db, 'artifacts', appId, 'public', 'data', 'stores', tx.storeId);
         await updateDoc(storeRef, { totalRevenue: increment(delta) });
       }
       // Save override until snapshot reflects
-      savedEditsRef.current[tx.id] = { senderName, simCardsSold, paymentAmount, clearance };
+      savedEditsRef.current[tx.id] = { senderName, simCardsSold, faultySims, paymentAmount, clearance };
       const overridesRaw = localStorage.getItem('edit_overrides');
       const overrides = overridesRaw ? JSON.parse(overridesRaw) : {};
-      overrides[tx.id] = { senderName, simCardsSold, paymentAmount, clearance };
+      overrides[tx.id] = { senderName, simCardsSold, faultySims, paymentAmount, clearance };
       localStorage.setItem('edit_overrides', JSON.stringify(overrides));
-      setLocalTx(prev => prev.map(p => p.id === tx.id ? { ...p, senderName, simCardsSold, paymentAmount, clearance } : p));
+      setLocalTx(prev => prev.map(p => p.id === tx.id ? { ...p, senderName, simCardsSold, faultySims, paymentAmount, clearance } : p));
       // Dispatch optimistic edit event so parent can reflect immediately before snapshot returns
-      window.dispatchEvent(new CustomEvent('optimisticTxEdit', { detail: { id: tx.id, storeId: tx.storeId, senderName, simCardsSold, paymentAmount, clearance } }));
+      window.dispatchEvent(new CustomEvent('optimisticTxEdit', { detail: { id: tx.id, storeId: tx.storeId, senderName, simCardsSold, faultySims, paymentAmount, clearance } }));
       cancelEdit();
     } catch (err) {
       console.error('Failed to save edit:', err);
@@ -372,6 +376,10 @@ const StoreAccordion: React.FC<{ store: StoreData; isExpanded: boolean; onToggle
                             <label className="text-[11px] uppercase tracking-wide text-gray-500">SIMs</label>
                             <input type="number" min={0} value={editFields.simCardsSold} onChange={(e) => setEditFields(f => ({ ...f, simCardsSold: e.target.value }))} className="w-full px-2 py-1 border rounded-md text-xs" />
                           </div>
+                          <div className="w-28">
+                            <label className="text-[11px] uppercase tracking-wide text-gray-500">Faulty SIMs</label>
+                            <input type="number" min={0} value={editFields.faultySims} onChange={(e) => setEditFields(f => ({ ...f, faultySims: e.target.value }))} className="w-full px-2 py-1 border rounded-md text-xs" />
+                          </div>
                           <div className="flex-1 min-w-[120px]">
                             <label className="text-[11px] uppercase tracking-wide text-gray-500">Amount (₦)</label>
                             <input type="number" min={0} value={editFields.paymentAmount} onChange={(e) => setEditFields(f => ({ ...f, paymentAmount: e.target.value }))} className="w-full px-2 py-1 border rounded-md text-xs" />
@@ -401,6 +409,9 @@ const StoreAccordion: React.FC<{ store: StoreData; isExpanded: boolean; onToggle
                           <div className="mt-1 flex flex-wrap items-center gap-2">
                             <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-gray-100 text-gray-700 text-[11px]"><User className="w-3.5 h-3.5" />{t.senderName}</span>
                             <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-teal-50 text-teal-700 text-[11px]"><PlusSquare className="w-3.5 h-3.5" />{t.simCardsSold} SIMs</span>
+                            {typeof t.faultySims === 'number' && t.faultySims > 0 && (
+                              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-orange-50 text-orange-700 text-[11px]"><AlertTriangle className="w-3.5 h-3.5" />Faulty: {t.faultySims}</span>
+                            )}
                             {t.remark && (
                               <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-gray-100 text-gray-600 text-[11px]">{t.remark}</span>
                             )}
@@ -854,6 +865,7 @@ const AddPaymentsView: React.FC<{ stores: StoreData[]; db: any; isAuthReady: boo
   const MONTH_OPTIONS = MONTH_ONLY_OPTIONS;
   const todayIso = new Date().toISOString().slice(0,10);
   const [formData, setFormData] = useState({ storeId: '', senderName: '', simCardsSold: '', paymentAmount: '', transactionMonth: currentMonthName, remarkType: 'serial issues', remarkText: '', receiptDate: '', clearance: 'NOT_CLEARED' as 'CLEARED' | 'NOT_CLEARED' });
+  const [faultySims, setFaultySims] = useState<string>('');
   const [statusMessage, setStatusMessage] = useState<{ type: 'success' | 'error' | ''; text: string }>({ type: '', text: '' });
   const [isLoading, setIsLoading] = useState(false);
 
@@ -874,16 +886,22 @@ const AddPaymentsView: React.FC<{ stores: StoreData[]; db: any; isAuthReady: boo
       }
       const amount = parseFloat(paymentAmount);
       const simCards = parseInt(simCardsSold, 10);
-      if (isNaN(amount) || amount <= 0 || isNaN(simCards) || simCards < 0) {
-        setStatusMessage({ type: 'error', text: 'Amount must be > 0 and SIMs >= 0.' });
+      const faulty = faultySims.trim() === '' ? undefined : parseInt(faultySims, 10);
+      if (isNaN(amount) || amount <= 0 || isNaN(simCards) || simCards < 0 || (faulty !== undefined && (isNaN(faulty) || faulty < 0))) {
+        setStatusMessage({ type: 'error', text: 'Amount > 0, SIMs/Faulty SIMs >= 0.' });
         return;
       }
-      const remark = remarkType === 'other' ? remarkText.trim() : (remarkType === 'serial issues' ? 'Serial issues' : 'NIN/KYC issues');
+      const remark = remarkType === 'other'
+        ? remarkText.trim()
+        : remarkType === 'serial issues'
+          ? 'Serial issues'
+          : 'NIN/KYC issues';
       const offlinePayment = {
         id: `local-pay-${Date.now()}`,
         storeId,
         senderName: senderName.trim(),
         simCardsSold: simCards,
+        faultySims: faulty,
         paymentAmount: amount,
         status: 'Completed',
         createdAt: new Date().toISOString(),
@@ -898,6 +916,7 @@ const AddPaymentsView: React.FC<{ stores: StoreData[]; db: any; isAuthReady: boo
         localStorage.setItem('pending_payments', JSON.stringify([...(Array.isArray(list) ? list : []), offlinePayment]));
         setStatusMessage({ type: 'success', text: 'Payment queued offline. Will upload when connected.' });
         setFormData((prev) => ({ storeId: prev.storeId, senderName: '', simCardsSold: '', paymentAmount: '', transactionMonth: prev.transactionMonth, remarkType: prev.remarkType, remarkText: '', receiptDate: '', clearance: prev.clearance }));
+        setFaultySims('');
         window.dispatchEvent(new Event('pendingPaymentsUpdated'));
       } catch (err) {
         console.error('Failed to queue payment offline:', err);
@@ -916,11 +935,16 @@ const AddPaymentsView: React.FC<{ stores: StoreData[]; db: any; isAuthReady: boo
     }
     const amount = parseFloat(paymentAmount);
     const simCards = parseInt(simCardsSold, 10);
-    if (isNaN(amount) || amount <= 0 || isNaN(simCards) || simCards < 0) {
-      setStatusMessage({ type: 'error', text: 'Payment amount must be > 0 and SIM card count >= 0.' });
+    const faulty = faultySims.trim() === '' ? undefined : parseInt(faultySims, 10);
+    if (isNaN(amount) || amount <= 0 || isNaN(simCards) || simCards < 0 || (faulty !== undefined && (isNaN(faulty) || faulty < 0))) {
+      setStatusMessage({ type: 'error', text: 'Payment > 0, SIMs/Faulty SIMs >= 0.' });
       return;
     }
-    const remark = remarkType === 'other' ? remarkText.trim() : (remarkType === 'serial issues' ? 'Serial issues' : 'NIN/KYC issues');
+    const remark = remarkType === 'other'
+      ? remarkText.trim()
+      : remarkType === 'serial issues'
+        ? 'Serial issues'
+        : 'NIN/KYC issues';
     setIsLoading(true);
     setStatusMessage({ type: '', text: '' });
     try {
@@ -958,6 +982,7 @@ const AddPaymentsView: React.FC<{ stores: StoreData[]; db: any; isAuthReady: boo
         const prev = existing.data() as any;
         const txRef = doc(db, 'artifacts', appId, 'public', 'data', 'transactions', existing.id);
         const updatePayload: any = { senderName: senderName.trim(), simCardsSold: simCards, paymentAmount: amount, remark };
+        if (faulty !== undefined) updatePayload.faultySims = faulty;
         if (receiptDate) updatePayload.receiptCollectionDate = receiptDate;
         if (clearance) updatePayload.clearance = clearance;
         await updateDoc(txRef, updatePayload);
@@ -971,13 +996,14 @@ const AddPaymentsView: React.FC<{ stores: StoreData[]; db: any; isAuthReady: boo
       } else {
         // Create new
         const newTransactionRef = doc(transactionsCollectionRef);
-        const newTransaction: Transaction = { id: newTransactionRef.id, storeId: effectiveStoreId, senderName: senderName.trim(), simCardsSold: simCards, paymentAmount: amount, status: 'Completed', createdAt: new Date().toISOString(), transactionMonth, remark, receiptCollectionDate: receiptDate || undefined, clearance };
+        const newTransaction: Transaction = { id: newTransactionRef.id, storeId: effectiveStoreId, senderName: senderName.trim(), simCardsSold: simCards, faultySims: faulty, paymentAmount: amount, status: 'Completed', createdAt: new Date().toISOString(), transactionMonth, remark, receiptCollectionDate: receiptDate || undefined, clearance };
         await setDoc(newTransactionRef, newTransaction);
         const storeRef = doc(db, 'artifacts', appId, 'public', 'data', 'stores', effectiveStoreId);
         await updateDoc(storeRef, { totalRevenue: increment(amount), entries: increment(1) });
         setStatusMessage({ type: 'success', text: `Payment of ${formatNaira(amount, 'full')} logged successfully!` });
       }
       setFormData((prev) => ({ storeId: prev.storeId, senderName: '', simCardsSold: '', paymentAmount: '', transactionMonth: prev.transactionMonth, remarkType: prev.remarkType, remarkText: '', receiptDate: '', clearance: prev.clearance }));
+      setFaultySims('');
     } catch (error) {
       console.error('Error logging payment or updating store: ', error);
       setStatusMessage({ type: 'error', text: 'Failed to log payment. Check console for details.' });
@@ -1036,6 +1062,11 @@ const AddPaymentsView: React.FC<{ stores: StoreData[]; db: any; isAuthReady: boo
           <div>
             <label htmlFor="simCardsSold" className="block text-sm font-medium text-gray-700 flex items-center mb-1"><PlusSquare className="w-4 h-4 mr-2 text-green-500" /> SIM Cards Sold</label>
             <input id="simCardsSold" name="simCardsSold" type="number" min="0" step="1" value={formData.simCardsSold} onChange={handleChange} required placeholder="0" className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-green-500 focus:border-green-500" disabled={isLoading} />
+          </div>
+          <div>
+            <label htmlFor="faultySims" className="block text-sm font-medium text-gray-700 flex items-center mb-1"><AlertTriangle className="w-4 h-4 mr-2 text-orange-500" /> Faulty SIMs</label>
+            <input id="faultySims" name="faultySims" type="number" min="0" step="1" value={faultySims} onChange={(e)=> setFaultySims(e.target.value)} placeholder="0" className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-green-500 focus:border-green-500" disabled={isLoading} />
+            <p className="text-xs text-gray-500 mt-1">Optional: count of faulty SIMs.</p>
           </div>
           <div>
             <label htmlFor="paymentAmount" className="block text-sm font-medium text-gray-700 flex items-center mb-1"><DollarSign className="w-4 h-4 mr-2 text-green-500" /> Payment Made (₦)</label>
@@ -1217,6 +1248,7 @@ const SettingsView: React.FC<{ db?: any; isAuthReady?: boolean; appId?: string; 
             transactionMonth: t.transactionMonth,
             senderName: t.senderName,
             simCardsSold: t.simCardsSold,
+            faultySims: t.faultySims ?? '',
             paymentAmount: t.paymentAmount,
             remark: t.remark || '',
             receiptCollectionDate: t.receiptCollectionDate || '',
@@ -1243,6 +1275,7 @@ const SettingsView: React.FC<{ db?: any; isAuthReady?: boolean; appId?: string; 
                   transactionMonth: p.transactionMonth,
                   senderName: p.senderName,
                   simCardsSold: p.simCardsSold,
+                  faultySims: p.faultySims ?? '',
                   paymentAmount: p.paymentAmount,
                   remark: p.remark || '',
                   receiptCollectionDate: p.receiptCollectionDate || '',
@@ -1275,7 +1308,7 @@ const SettingsView: React.FC<{ db?: any; isAuthReady?: boolean; appId?: string; 
       }
       const fileBase = `sales-report-${month}-${new Date().toISOString().slice(0,10)}`;
       if (format === 'csv') {
-        const headers = ['storeId','storeName','location','transactionMonth','senderName','simCardsSold','paymentAmount','remark','receiptCollectionDate','createdAt','status','clearance'];
+        const headers = ['storeId','storeName','location','transactionMonth','senderName','simCardsSold','faultySims','paymentAmount','remark','receiptCollectionDate','createdAt','status','clearance'];
         const csv = [headers.join(',')].concat(
           data.map(r => headers.map(h => {
             const v = r[h] ?? '';
@@ -1299,7 +1332,7 @@ const SettingsView: React.FC<{ db?: any; isAuthReady?: boolean; appId?: string; 
           mod = await import('xlsx');
         }
         const XLSX: any = (mod as any)?.default ?? mod;
-        const headers = ['storeId','storeName','location','transactionMonth','senderName','simCardsSold','paymentAmount','remark','receiptCollectionDate','createdAt','status','clearance'];
+        const headers = ['storeId','storeName','location','transactionMonth','senderName','simCardsSold','faultySims','paymentAmount','remark','receiptCollectionDate','createdAt','status','clearance'];
         const ws = XLSX.utils.json_to_sheet(data, { header: headers, skipHeader: false });
 
         // Apply red/green fill on the Store Name cell based on clearance value
@@ -1537,12 +1570,12 @@ const App: React.FC = () => {
     const onOptimisticEdit = (e: any) => {
       const d = e.detail || {};
       if (!d.id) return;
-      setOptimisticTxEdits(prev => ({ ...prev, [d.id]: { senderName: d.senderName, simCardsSold: d.simCardsSold, paymentAmount: d.paymentAmount, clearance: d.clearance } }));
+      setOptimisticTxEdits(prev => ({ ...prev, [d.id]: { senderName: d.senderName, simCardsSold: d.simCardsSold, faultySims: d.faultySims, paymentAmount: d.paymentAmount, clearance: d.clearance } }));
       // Persist overrides across refresh until snapshot matches
       try {
         const overridesRaw = localStorage.getItem('edit_overrides');
         const overrides = overridesRaw ? JSON.parse(overridesRaw) : {};
-        overrides[d.id] = { senderName: d.senderName, simCardsSold: d.simCardsSold, paymentAmount: d.paymentAmount, clearance: d.clearance };
+        overrides[d.id] = { senderName: d.senderName, simCardsSold: d.simCardsSold, faultySims: d.faultySims, paymentAmount: d.paymentAmount, clearance: d.clearance };
         localStorage.setItem('edit_overrides', JSON.stringify(overrides));
       } catch {}
     };
@@ -1620,6 +1653,7 @@ const App: React.FC = () => {
           storeId: data.storeId,
           senderName: data.senderName,
           simCardsSold: data.simCardsSold,
+          faultySims: data.faultySims,
           paymentAmount: data.paymentAmount,
           status: data.status || 'Completed',
           createdAt: data.createdAt,
@@ -1660,28 +1694,12 @@ const App: React.FC = () => {
         const monthIndex = m[p.storeId].findIndex(r => r.transactionMonth === p.transactionMonth);
         if (monthIndex >= 0) {
           const remote = m[p.storeId][monthIndex];
-          m[p.storeId][monthIndex] = { ...remote, senderName: p.senderName, simCardsSold: p.simCardsSold, paymentAmount: p.paymentAmount, remark: p.remark, receiptCollectionDate: p.receiptCollectionDate ?? remote.receiptCollectionDate, clearance: p.clearance ?? remote.clearance };
+          m[p.storeId][monthIndex] = { ...remote, senderName: p.senderName, simCardsSold: p.simCardsSold, faultySims: p.faultySims ?? remote.faultySims, paymentAmount: p.paymentAmount, remark: p.remark, receiptCollectionDate: p.receiptCollectionDate ?? remote.receiptCollectionDate, clearance: p.clearance ?? remote.clearance };
         } else {
           m[p.storeId].push(p);
         }
       }
     } catch {/* ignore */}
-    // Apply persisted edit overrides (survives refresh) prior to optimistic state
-    try {
-      const overridesRaw = localStorage.getItem('edit_overrides');
-      if (overridesRaw) {
-        const overrides = JSON.parse(overridesRaw) || {};
-        Object.keys(overrides).forEach(id => {
-          for (const key of Object.keys(m)) {
-            const idx = m[key].findIndex(tx => tx.id === id);
-            if (idx >= 0) {
-              m[key][idx] = { ...m[key][idx], ...overrides[id] };
-              break;
-            }
-          }
-        });
-      }
-    } catch {/* ignore overrides parse */}
     for (const key of Object.keys(m)) {
       m[key].sort((a, b) => a.transactionMonth.localeCompare(b.transactionMonth));
       // Apply optimistic overrides
@@ -1700,6 +1718,7 @@ const App: React.FC = () => {
         if (!opt) continue;
         if ((opt.senderName === undefined || opt.senderName === t.senderName) &&
             (opt.simCardsSold === undefined || opt.simCardsSold === t.simCardsSold) &&
+            (opt.faultySims === undefined || opt.faultySims === t.faultySims) &&
             (opt.paymentAmount === undefined || opt.paymentAmount === t.paymentAmount) &&
             (opt.clearance === undefined || opt.clearance === t.clearance)) {
           delete next[t.id];
@@ -1716,7 +1735,7 @@ const App: React.FC = () => {
       Object.keys(overrides).forEach(id => {
         const remote = transactions.find(t => t.id === id);
         const ov = overrides[id];
-        if (remote && ov && remote.senderName === ov.senderName && remote.simCardsSold === ov.simCardsSold && remote.paymentAmount === ov.paymentAmount && (ov.clearance === undefined || remote.clearance === ov.clearance)) {
+        if (remote && ov && remote.senderName === ov.senderName && remote.simCardsSold === ov.simCardsSold && (ov.faultySims === undefined || remote.faultySims === ov.faultySims) && remote.paymentAmount === ov.paymentAmount && (ov.clearance === undefined || remote.clearance === ov.clearance)) {
           delete overrides[id];
           changed = true;
         }
@@ -1787,6 +1806,7 @@ const App: React.FC = () => {
               const prev = existing.data() as any;
               const txRef = doc(db, 'artifacts', appId, 'public', 'data', 'transactions', existing.id);
               const payload: any = { senderName: p.senderName, simCardsSold: p.simCardsSold, paymentAmount: p.paymentAmount, remark: p.remark };
+              if (p.faultySims !== undefined) payload.faultySims = p.faultySims;
               if (p.receiptCollectionDate) payload.receiptCollectionDate = p.receiptCollectionDate;
               if (p.clearance) payload.clearance = p.clearance;
               await updateDoc(txRef, payload);
