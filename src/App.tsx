@@ -4,7 +4,7 @@ import { DollarSign, TrendingUp, BarChart as BarChartIcon, Clock, PlusSquare, Se
 // (merged into single import above)
 import { initializeApp } from 'firebase/app';
 import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
-import { getFirestore, doc, setDoc, updateDoc, collection, onSnapshot, increment, deleteDoc, query, where, getDocs, writeBatch } from 'firebase/firestore';
+import { getFirestore, doc, setDoc, updateDoc, collection, onSnapshot, increment, deleteDoc, query, where, getDocs, writeBatch, arrayUnion, arrayRemove, deleteField } from 'firebase/firestore';
 // Lightweight error boundary to prevent chart crashes blanking the app
 function ChartErrorBoundary({ children }: { children: React.ReactNode }) {
   const [error, setError] = React.useState<Error | null>(null);
@@ -54,6 +54,7 @@ interface Transaction {
   remark: string;
   receiptCollectionDate?: string; // ISO 'YYYY-MM-DD'
   clearance?: 'CLEARED' | 'NOT_CLEARED';
+  receipts?: Array<{ date: string; note?: string }>;
 }
 interface StoreData {
   id: string;
@@ -81,6 +82,33 @@ const formatNaira = (amount: number, formatType: 'full' | 'short') => {
     return amount.toLocaleString('en-NG', { style: 'currency', currency: 'NGN', minimumFractionDigits: 0 });
   }
   return `₦${(amount / 1_000_000).toFixed(1)}M`;
+};
+
+const toDDMMYY = (input: string) => {
+  if (!input) return input;
+  const s = String(input).trim();
+  // ISO yyyy-mm-dd
+  const iso = s.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (iso) {
+    const [, y, m, d] = iso;
+    return `${d}-${m}-${y.slice(2)}`;
+  }
+  // Extract three numeric groups with any non-digit separators
+  const m3 = s.match(/^(\d{1,2})\D+(\d{1,2})\D+(\d{2,4})$/);
+  if (m3) {
+    const a = parseInt(m3[1], 10);
+    const b = parseInt(m3[2], 10);
+    const cRaw = m3[3];
+    const c = cRaw.length === 4 ? parseInt(cRaw.slice(2), 10) : parseInt(cRaw, 10);
+    // If first group > 12, treat as DD-MM-YY else treat as MM-DD-YY
+    const dd = a > 12 ? a : b;
+    const mm = a > 12 ? b : a;
+    const ddS = String(dd).padStart(2, '0');
+    const mmS = String(mm).padStart(2, '0');
+    const yyS = String(c).padStart(2, '0');
+    return `${ddS}-${mmS}-${yyS}`;
+  }
+  return s;
 };
 
 const MOCK_MONTHLY_SALES: MonthlySale[] = [
@@ -153,11 +181,14 @@ const StoreAccordion: React.FC<{ store: StoreData; isExpanded: boolean; onToggle
     { senderName: '', simCardsSold: '', faultySims: '', paymentAmount: '', clearance: 'NOT_CLEARED' }
   );
   const [saving, setSaving] = useState(false);
+  const [receiptModal, setReceiptModal] = useState<{ open: boolean; txId?: string; date: string; note: string }>({ open: false, txId: undefined, date: new Date().toISOString().slice(0,10), note: '' });
+  const [receiptsListModal, setReceiptsListModal] = useState<{ open: boolean; txId?: string }>({ open: false, txId: undefined });
   const savedEditsRef = React.useRef<Record<string, { senderName: string; simCardsSold: number; faultySims?: number; paymentAmount: number; clearance?: 'CLEARED' | 'NOT_CLEARED' }>>({});
   // Always derive revenue from current transaction list (includes pending & optimistic edits)
   const computedRevenue = useMemo(() => {
     return localTx.reduce((sum, t) => sum + (typeof t.paymentAmount === 'number' ? t.paymentAmount : 0), 0);
   }, [localTx]);
+
 
   const handleRenameStore = async () => {
     const newName = window.prompt('Enter new store name', store.name);
@@ -332,7 +363,8 @@ const StoreAccordion: React.FC<{ store: StoreData; isExpanded: boolean; onToggle
     }
   };
   return (
-    <div className="mb-2 rounded-xl border border-gray-200 overflow-hidden shadow-sm transition-shadow hover:shadow-md animate-fade-in">
+    <>
+    <div className="mb-2 rounded-xl border border-gray-200 overflow-visible shadow-sm transition-shadow hover:shadow-md animate-fade-in">
       <div className="flex items-center justify-between w-full p-4 bg-white">
         <div className="flex items-center gap-3">
           <button title="Delete store" onClick={() => onDelete(store)} className="shrink-0 w-6 h-6 rounded-md bg-red-600 text-white flex items-center justify-center hover:bg-red-700">
@@ -415,8 +447,17 @@ const StoreAccordion: React.FC<{ store: StoreData; isExpanded: boolean; onToggle
                             {t.remark && (
                               <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-gray-100 text-gray-600 text-[11px]">{t.remark}</span>
                             )}
-                            {t.receiptCollectionDate && (
-                              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-blue-50 text-blue-700 text-[11px]">Receipt: {t.receiptCollectionDate}</span>
+                            {Array.isArray(t.receipts) && t.receipts.length > 0 ? (
+                              // If there's a legacy single receipt AND at least one in receipts[], show the modal trigger to avoid seeming like a replacement
+                              (t.receipts.length > 1 || t.receiptCollectionDate) ? (
+                                <button onClick={() => setReceiptsListModal({ open: true, txId: t.id })} className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-blue-50 text-blue-700 text-[11px] hover:bg-blue-100">Receipts…</button>
+                              ) : (
+                                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-blue-50 text-blue-700 text-[11px]">Receipt: {toDDMMYY(t.receipts[0]?.date)}</span>
+                              )
+                            ) : (
+                              t.receiptCollectionDate ? (
+                                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-blue-50 text-blue-700 text-[11px]">Receipt: {toDDMMYY(t.receiptCollectionDate)}</span>
+                              ) : null
                             )}
                             {t.clearance && (
                               <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] ${t.clearance === 'CLEARED' ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}>
@@ -429,6 +470,7 @@ const StoreAccordion: React.FC<{ store: StoreData; isExpanded: boolean; onToggle
                         <div className="flex items-center gap-3">
                           <div className={`font-semibold text-green-700`}>{formatNaira(t.paymentAmount, 'full')}</div>
                           <button onClick={() => startEdit(t)} className="px-2 py-1 text-xs rounded-md bg-indigo-100 text-indigo-700 hover:bg-indigo-200 transition">Edit</button>
+                          <button onClick={() => setReceiptModal({ open: true, txId: t.id, date: new Date().toISOString().slice(0,10), note: '' })} className="px-2 py-1 text-xs rounded-md bg-blue-100 text-blue-700 hover:bg-blue-200 transition">Add Receipt</button>
                           <button onClick={() => deleteTransaction(t)} className="px-2 py-1 text-xs rounded-md bg-red-100 text-red-700 hover:bg-red-200 transition">Delete</button>
                         </div>
                       </>
@@ -441,6 +483,180 @@ const StoreAccordion: React.FC<{ store: StoreData; isExpanded: boolean; onToggle
         </div>
       )}
     </div>
+    {receiptModal.open ? (
+      <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
+        <div className="bg-white rounded-xl shadow-lg border border-gray-200 w-[95%] max-w-md p-6">
+          <h3 className="text-lg font-semibold text-gray-900 mb-3">Add Receipt</h3>
+          <div className="space-y-4">
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">Receipt Date</label>
+              <input type="date" value={receiptModal.date} onChange={(e)=> setReceiptModal(m=> ({...m, date: e.target.value}))} className="w-full px-3 py-2 border rounded-md" />
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">Note (optional)</label>
+              <input type="text" value={receiptModal.note} onChange={(e)=> setReceiptModal(m=> ({...m, note: e.target.value}))} className="w-full px-3 py-2 border rounded-md" placeholder="e.g., courier name or reference" />
+            </div>
+          </div>
+          <div className="mt-4 flex items-center justify-end gap-3">
+            <button onClick={()=> setReceiptModal({ open: false, txId: undefined, date: new Date().toISOString().slice(0,10), note: '' })} className="px-3 py-2 rounded-md bg-gray-200 text-gray-700 hover:bg-gray-300">Cancel</button>
+            <button onClick={async ()=>{
+              const txId = receiptModal.txId;
+              const date = receiptModal.date;
+              const note = receiptModal.note.trim() || undefined;
+              if (!txId || !date) { setReceiptModal(m=> ({...m, open:false})); return; }
+              const target = localTx.find(x=> x.id === txId);
+              if (!target) { setReceiptModal(m=> ({...m, open:false})); return; }
+              const receipt = { date: toDDMMYY(date), note };
+              if (!db || !isAuthReady || !appId) {
+                try {
+                  const raw = localStorage.getItem('pending_payments');
+                  const list = raw ? JSON.parse(raw) : [];
+                  let arr = Array.isArray(list) ? list : [];
+                  const idx = arr.findIndex((p: any) => p.id === target.id || (p.storeId === target.storeId && p.transactionMonth === target.transactionMonth));
+                  if (idx >= 0) {
+                    const existing = arr[idx];
+                    const nextReceipts = Array.isArray(existing.receipts) ? [...existing.receipts, receipt] : [receipt];
+                    arr[idx] = { ...existing, receipts: nextReceipts };
+                  } else {
+                    arr.push({ ...target, receipts: Array.isArray(target.receipts) ? [...target.receipts, receipt] : [receipt] });
+                  }
+                  localStorage.setItem('pending_payments', JSON.stringify(arr));
+                  setLocalTx(prev => prev.map(p => p.id === target.id ? { ...p, receipts: Array.isArray(p.receipts) ? [...p.receipts, receipt] : [receipt] } : p));
+                  window.dispatchEvent(new Event('pendingPaymentsUpdated'));
+                } catch (err) {
+                  console.error('Failed to queue receipt offline:', err);
+                  alert('Could not add receipt offline.');
+                }
+                setReceiptModal(m=> ({...m, open:false}));
+                return;
+              }
+              try {
+                const txRef = doc(db, 'artifacts', appId!, 'public', 'data', 'transactions', target.id);
+                await updateDoc(txRef, { receipts: arrayUnion(receipt) });
+                setLocalTx(prev => prev.map(p => p.id === target.id ? { ...p, receipts: Array.isArray(p.receipts) ? [...p.receipts, receipt] : [receipt] } : p));
+              } catch (err) {
+                console.error('Failed to add receipt:', err);
+                alert('Failed to add receipt.');
+              }
+              setReceiptModal(m=> ({...m, open:false}));
+            }} className="px-3 py-2 rounded-md bg-blue-600 text-white hover:bg-blue-700">Add</button>
+          </div>
+        </div>
+      </div>
+    ) : null}
+    {receiptsListModal?.open ? (
+      <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
+        <div className="bg-white rounded-xl shadow-lg border border-gray-200 w-[95%] max-w-md p-6">
+          <h3 className="text-lg font-semibold text-gray-900 mb-3">Receipts</h3>
+          <div className="max-h-80 overflow-auto divide-y">
+            {(() => {
+              const tx = localTx.find(x => x.id === receiptsListModal.txId);
+              const baseList = Array.isArray(tx?.receipts) ? tx!.receipts : [];
+              // Merge legacy single receipt if present
+              const merged = [...baseList];
+              if (tx?.receiptCollectionDate) {
+                const legacyDate = toDDMMYY(tx.receiptCollectionDate);
+                const exists = merged.some(r => toDDMMYY(r.date) === legacyDate && (r.note ?? '') === '');
+                if (!exists) merged.push({ date: tx.receiptCollectionDate });
+              }
+              // Dedupe by normalized date + note
+              const seen = new Set<string>();
+              const deduped = merged.filter(r => {
+                const key = `${toDDMMYY(r.date)}|${r.note ?? ''}`;
+                if (seen.has(key)) return false;
+                seen.add(key);
+                return true;
+              });
+              const parseToDate = (raw: string) => {
+                if (!raw) return new Date(0);
+                const s = raw.replace(/[\/.]/g,'-');
+                const parts = s.split('-');
+                if (parts.length === 3) {
+                  // Handle DD-MM-YY and MM-DD-YY
+                  const p0 = parseInt(parts[0],10);
+                  const p1 = parseInt(parts[1],10);
+                  const yy = parts[2].length === 4 ? parseInt(parts[2].slice(2),10) : parseInt(parts[2],10);
+                  // If first part > 12, treat as DD-MM-YY
+                  const dd = p0 > 12 ? p0 : parseInt(parts[1],10);
+                  const mm = p0 > 12 ? p1 : parseInt(parts[0],10);
+                  return new Date(2000 + yy, mm - 1, dd);
+                }
+                // Fallback ISO yyyy-mm-dd
+                const d = new Date(raw);
+                return isNaN(d.getTime()) ? new Date(0) : d;
+              };
+              const sorted = [...deduped].sort((a,b)=> parseToDate(a.date).getTime() - parseToDate(b.date).getTime());
+              return sorted.map((r, idx) => (
+              <div key={idx} className="py-2 flex items-start justify-between gap-3">
+                <div>
+                  <div className="text-sm font-medium text-gray-900">{toDDMMYY(r.date)}</div>
+                  {r.note && <div className="text-xs text-gray-600">{r.note}</div>}
+                </div>
+                 <button
+                  title="Delete receipt"
+                  className="shrink-0 p-2 rounded-md bg-red-50 text-red-600 hover:bg-red-100"
+                  onClick={async ()=>{
+                    const txId = receiptsListModal.txId;
+                    if (!txId) return;
+                    const target = localTx.find(x=> x.id === txId);
+                    if (!target) return;
+                     const receiptObj = { date: r.date, note: r.note };
+                     const isLegacyMatch = !!target.receiptCollectionDate && (toDDMMYY(target.receiptCollectionDate) === toDDMMYY(receiptObj.date)) && (!receiptObj.note || receiptObj.note === '');
+                    if (!db || !isAuthReady || !appId) {
+                      try {
+                        const raw = localStorage.getItem('pending_payments');
+                        const list = raw ? JSON.parse(raw) : [];
+                        let arr = Array.isArray(list) ? list : [];
+                        const idxP = arr.findIndex((p: any) => p.id === target.id || (p.storeId === target.storeId && p.transactionMonth === target.transactionMonth));
+                        if (idxP >= 0) {
+                          const existing = arr[idxP];
+                           const nextReceipts = (Array.isArray(existing.receipts) ? existing.receipts : []).filter((x: any) => !(toDDMMYY(x.date) === toDDMMYY(receiptObj.date) && (x.note ?? '') === (receiptObj.note ?? '')));
+                           const nextObj = { ...existing, receipts: nextReceipts };
+                           if (isLegacyMatch) nextObj.receiptCollectionDate = undefined;
+                           arr[idxP] = nextObj;
+                        } else {
+                           const nextReceipts = (Array.isArray(target.receipts) ? target.receipts : []).filter((x: any) => !(toDDMMYY(x.date) === toDDMMYY(receiptObj.date) && (x.note ?? '') === (receiptObj.note ?? '')));
+                           const nextObj = { ...target, receipts: nextReceipts } as any;
+                           if (isLegacyMatch) nextObj.receiptCollectionDate = undefined;
+                           arr.push(nextObj);
+                        }
+                        localStorage.setItem('pending_payments', JSON.stringify(arr));
+                         setLocalTx(prev => prev.map(p => p.id === target.id ? { ...p, receiptCollectionDate: isLegacyMatch ? undefined : p.receiptCollectionDate, receipts: (Array.isArray(p.receipts) ? p.receipts : []).filter((x:any)=> !(toDDMMYY(x.date) === toDDMMYY(receiptObj.date) && (x.note ?? '') === (receiptObj.note ?? ''))) } : p));
+                        window.dispatchEvent(new Event('pendingPaymentsUpdated'));
+                      } catch (err) {
+                        console.error('Failed to delete receipt offline:', err);
+                        alert('Could not delete receipt offline.');
+                      }
+                      return;
+                    }
+                    try {
+                      const txRef = doc(db, 'artifacts', appId!, 'public', 'data', 'transactions', target.id);
+                       // Remove from receipts array if present
+                       await updateDoc(txRef, { receipts: arrayRemove(receiptObj) });
+                       // If legacy matches, clear legacy field as well
+                       if (isLegacyMatch) {
+                         await updateDoc(txRef, { receiptCollectionDate: deleteField() });
+                       }
+                       setLocalTx(prev => prev.map(p => p.id === target.id ? { ...p, receiptCollectionDate: isLegacyMatch ? undefined : p.receiptCollectionDate, receipts: (Array.isArray(p.receipts) ? p.receipts : []).filter((x:any)=> !(toDDMMYY(x.date) === toDDMMYY(receiptObj.date) && (x.note ?? '') === (receiptObj.note ?? ''))) } : p));
+                    } catch (err) {
+                      console.error('Failed to delete receipt:', err);
+                      alert('Failed to delete receipt.');
+                    }
+                  }}
+                >
+                  <Trash className="w-4 h-4" />
+                </button>
+              </div>
+              ));
+            })()}
+          </div>
+          <div className="mt-4 text-right">
+            <button onClick={() => setReceiptsListModal({ open: false, txId: undefined })} className="px-3 py-2 rounded-md bg-gray-200 text-gray-700 hover:bg-gray-300">Close</button>
+          </div>
+        </div>
+      </div>
+    ) : null}
+    </>
   );
 };
 
@@ -473,6 +689,7 @@ const StoresListView: React.FC<{ stores: StoreData[]; db?: any; isAuthReady?: bo
       store.location.toLowerCase().includes(searchText.toLowerCase())
     );
   }, [searchText, stores]);
+
 
   const monthFilteredTxByStore = useMemo(() => {
     if (!transactionsByStore) return {} as Record<string, Transaction[]>;
@@ -661,7 +878,7 @@ const AddStoreView: React.FC<{ db: any; isAuthReady: boolean; setView: (view: Vi
     <div className="p-4 sm:p-8">
       <h1 className="text-3xl font-extrabold text-gray-900 mb-6 border-b pb-2 border-red-100 flex items-center">
         <Plus className="w-7 h-7 mr-3 text-red-600" />
-        Register New Store (Quick Entry)
+        Register New Store
       </h1>
       <form onSubmit={handleAddStore} className="bg-white p-6 md:p-8 rounded-xl shadow-lg border border-gray-100 max-w-2xl mx-auto space-y-6">
         {statusMessage.text && (
@@ -868,6 +1085,8 @@ const AddPaymentsView: React.FC<{ stores: StoreData[]; db: any; isAuthReady: boo
   const [faultySims, setFaultySims] = useState<string>('');
   const [statusMessage, setStatusMessage] = useState<{ type: 'success' | 'error' | ''; text: string }>({ type: '', text: '' });
   const [isLoading, setIsLoading] = useState(false);
+  const [storeQuery, setStoreQuery] = useState<string>('');
+  const [storeDropdownOpen, setStoreDropdownOpen] = useState<boolean>(false);
 
   const handleChange = (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>) => setFormData({ ...formData, [e.target.name]: e.target.value });
 
@@ -907,7 +1126,7 @@ const AddPaymentsView: React.FC<{ stores: StoreData[]; db: any; isAuthReady: boo
         createdAt: new Date().toISOString(),
         transactionMonth,
         remark,
-        receiptCollectionDate: receiptDate || undefined,
+        receiptCollectionDate: receiptDate ? toDDMMYY(receiptDate) : undefined,
         clearance
       } as Transaction;
       try {
@@ -983,7 +1202,7 @@ const AddPaymentsView: React.FC<{ stores: StoreData[]; db: any; isAuthReady: boo
         const txRef = doc(db, 'artifacts', appId, 'public', 'data', 'transactions', existing.id);
         const updatePayload: any = { senderName: senderName.trim(), simCardsSold: simCards, paymentAmount: amount, remark };
         if (faulty !== undefined) updatePayload.faultySims = faulty;
-        if (receiptDate) updatePayload.receiptCollectionDate = receiptDate;
+        if (receiptDate) updatePayload.receiptCollectionDate = toDDMMYY(receiptDate);
         if (clearance) updatePayload.clearance = clearance;
         await updateDoc(txRef, updatePayload);
         // Adjust store revenue by delta
@@ -996,7 +1215,7 @@ const AddPaymentsView: React.FC<{ stores: StoreData[]; db: any; isAuthReady: boo
       } else {
         // Create new
         const newTransactionRef = doc(transactionsCollectionRef);
-        const newTransaction: Transaction = { id: newTransactionRef.id, storeId: effectiveStoreId, senderName: senderName.trim(), simCardsSold: simCards, faultySims: faulty, paymentAmount: amount, status: 'Completed', createdAt: new Date().toISOString(), transactionMonth, remark, receiptCollectionDate: receiptDate || undefined, clearance };
+        const newTransaction: Transaction = { id: newTransactionRef.id, storeId: effectiveStoreId, senderName: senderName.trim(), simCardsSold: simCards, faultySims: faulty, paymentAmount: amount, status: 'Completed', createdAt: new Date().toISOString(), transactionMonth, remark, receiptCollectionDate: receiptDate ? toDDMMYY(receiptDate) : undefined, clearance };
         await setDoc(newTransactionRef, newTransaction);
         const storeRef = doc(db, 'artifacts', appId, 'public', 'data', 'stores', effectiveStoreId);
         await updateDoc(storeRef, { totalRevenue: increment(amount), entries: increment(1) });
@@ -1012,11 +1231,22 @@ const AddPaymentsView: React.FC<{ stores: StoreData[]; db: any; isAuthReady: boo
     }
   };
 
-  const selectableStores = useMemo(() => {
-    // Allow selecting local pending stores; we'll sync them on submit
-    return stores;
-  }, [stores]);
-  const isStoreListEmpty = selectableStores.length === 0;
+  const filteredStores = useMemo(() => {
+    const q = storeQuery.trim().toLowerCase();
+    if (!q) return stores;
+    return stores.filter(s => (
+      (s.name || '').toLowerCase().includes(q) ||
+      (s.location || '').toLowerCase().includes(q) ||
+      (s.owner || '').toLowerCase().includes(q)
+    ));
+  }, [stores, storeQuery]);
+  const isStoreListEmpty = stores.length === 0;
+
+  // Keep visible query in sync when storeId changes (e.g., after local->remote mapping)
+  useEffect(() => {
+    const sel = stores.find(s => s.id === formData.storeId);
+    if (sel) setStoreQuery(sel.name);
+  }, [formData.storeId, stores]);
   return (
     <div className="p-4 sm:p-8">
       <h1 className="text-3xl font-extrabold text-gray-900 mb-6 border-b pb-2 border-green-100 flex items-center">
@@ -1032,13 +1262,30 @@ const AddPaymentsView: React.FC<{ stores: StoreData[]; db: any; isAuthReady: boo
         )}
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-6">
           <div>
-            <label htmlFor="storeId" className="block text-sm font-medium text-gray-700 flex items-center mb-1"><Store className="w-4 h-4 mr-2 text-green-500" /> Select Store</label>
-            <select id="storeId" name="storeId" value={formData.storeId} onChange={handleChange} required className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-green-500 focus:border-green-500 bg-white disabled:bg-gray-50" disabled={isStoreListEmpty || isLoading}>
-              <option value="">-- Choose a Store --</option>
-              {selectableStores.map((store) => (
-                <option key={store.id} value={store.id}>{store.name}</option>
-              ))}
-            </select>
+            <label className="block text-sm font-medium text-gray-700 flex items-center mb-1"><Store className="w-4 h-4 mr-2 text-green-500" /> Select Store</label>
+            <div className="relative">
+              <input
+                type="text"
+                value={storeQuery}
+                onChange={(e)=> { setStoreQuery(e.target.value); setStoreDropdownOpen(true); }}
+                onFocus={()=> setStoreDropdownOpen(true)}
+                onBlur={()=> setTimeout(()=> setStoreDropdownOpen(false), 150)}
+                placeholder="Search or select a store"
+                className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-green-500 focus:border-green-500 bg-white disabled:bg-gray-50"
+                disabled={isLoading || isStoreListEmpty}
+              />
+              {storeDropdownOpen && filteredStores.length > 0 && (
+                <ul className="absolute z-20 mt-1 max-h-56 w-full overflow-auto rounded-md bg-white py-1 text-sm shadow-lg ring-1 ring-black/5">
+                  {filteredStores.map((s) => (
+                    <li key={s.id}>
+                      <button type="button" className="w-full text-left px-3 py-2 hover:bg-green-50" onClick={()=> { setFormData(prev=> ({ ...prev, storeId: s.id })); setStoreQuery(s.name); setStoreDropdownOpen(false); }}>
+                        {s.name}
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
           </div>
           <div>
             <label htmlFor="transactionMonth" className="block text-sm font-medium text-gray-700 flex items-center mb-1"><Clock className="w-4 h-4 mr-2 text-green-500" /> Transaction Month</label>
@@ -1241,6 +1488,22 @@ const SettingsView: React.FC<{ db?: any; isAuthReady?: boolean; appId?: string; 
           const t = docSnap.data();
           const s = storeMap[t.storeId] || {} as StoreData;
           const resolvedLocation = (s.location && !['Quick Entry','Imported'].includes(s.location)) ? s.location : (s.name || '');
+          // Build combined receipts string from receipts[] and legacy receiptCollectionDate
+          const receiptsArr: string[] = [];
+          if (Array.isArray(t.receipts)) {
+            for (const r of t.receipts) {
+              if (!r) continue;
+              const d = toDDMMYY(r.date || r);
+              const note = (r.note || '').toString().trim();
+              receiptsArr.push(note ? `${d} ${note}` : d);
+            }
+          }
+          if (t.receiptCollectionDate) {
+            const legacy = toDDMMYY(t.receiptCollectionDate);
+            // Avoid duplicate if already present
+            if (!receiptsArr.some(x => x.startsWith(legacy))) receiptsArr.push(legacy);
+          }
+          const receiptsCombined = receiptsArr.join(' || ');
           rows.push({
             storeId: t.storeId,
             storeName: s.name || '',
@@ -1251,6 +1514,7 @@ const SettingsView: React.FC<{ db?: any; isAuthReady?: boolean; appId?: string; 
             faultySims: t.faultySims ?? '',
             paymentAmount: t.paymentAmount,
             remark: t.remark || '',
+            receipts: receiptsCombined,
             receiptCollectionDate: t.receiptCollectionDate || '',
             createdAt: t.createdAt || '',
             status: t.status || 'Completed',
@@ -1268,6 +1532,21 @@ const SettingsView: React.FC<{ db?: any; isAuthReady?: boolean; appId?: string; 
               if (p.transactionMonth === month) {
                 const s = storeMap[p.storeId] || {} as StoreData;
                 const resolvedLocation = (s.location && !['Quick Entry','Imported'].includes(s.location)) ? s.location : (s.name || '');
+                // Build receipts string for pending item
+                const receiptsArr: string[] = [];
+                if (Array.isArray(p.receipts)) {
+                  for (const r of p.receipts) {
+                    if (!r) continue;
+                    const d = toDDMMYY(r.date || r);
+                    const note = (r.note || '').toString().trim();
+                    receiptsArr.push(note ? `${d} ${note}` : d);
+                  }
+                }
+                if (p.receiptCollectionDate) {
+                  const legacy = toDDMMYY(p.receiptCollectionDate);
+                  if (!receiptsArr.some(x => x.startsWith(legacy))) receiptsArr.push(legacy);
+                }
+                const receiptsCombined = receiptsArr.join(' || ');
                 rows.push({
                   storeId: p.storeId,
                   storeName: s.name || '',
@@ -1278,6 +1557,7 @@ const SettingsView: React.FC<{ db?: any; isAuthReady?: boolean; appId?: string; 
                   faultySims: p.faultySims ?? '',
                   paymentAmount: p.paymentAmount,
                   remark: p.remark || '',
+                  receipts: receiptsCombined,
                   receiptCollectionDate: p.receiptCollectionDate || '',
                   createdAt: p.createdAt || '',
                   status: p.status || 'Completed (Pending Sync)',
@@ -1308,63 +1588,90 @@ const SettingsView: React.FC<{ db?: any; isAuthReady?: boolean; appId?: string; 
       }
       const fileBase = `sales-report-${month}-${new Date().toISOString().slice(0,10)}`;
       if (format === 'csv') {
-        const headers = ['storeId','storeName','location','transactionMonth','senderName','simCardsSold','faultySims','paymentAmount','remark','receiptCollectionDate','createdAt','status','clearance'];
-        const csv = [headers.join(',')].concat(
-          data.map(r => headers.map(h => {
-            const v = r[h] ?? '';
-            const sv = typeof v === 'string' ? v.replace(/"/g,'""') : v;
-            return `"${sv}"`;
-          }).join(','))
-        ).join('\n');
-        const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+        // Exclude createdAt and status from CSV; no emoji in clearance text
+        const headers = ['storeId','storeName','location','transactionMonth','senderName','simCardsSold','faultySims','paymentAmount','remark','receipts','clearance'];
+        // Use CRLF for Windows Excel and produce a UTF-8-encoded Blob with explicit BOM bytes
+        const EOL = '\r\n';
+        const headerLine = headers.map(h => `"${String(h).replace(/"/g,'""')}"`).join(',');
+        const rows = data.map(r => headers.map(h => {
+          let v: any = r[h] ?? '';
+          if (h === 'clearance') {
+            v = String(r.clearance || '').replace(/_/g,' ').toUpperCase().trim();
+          }
+          const sv = typeof v === 'string' ? v.replace(/"/g,'""') : String(v);
+          return `"${sv}"`;
+        }).join(',')).join(EOL);
+        const csv = [headerLine, rows].join(EOL);
+        const encoder = new TextEncoder();
+        const bomBytes = new Uint8Array([0xEF,0xBB,0xBF]);
+        const csvBytes = encoder.encode(csv);
+        const blob = new Blob([bomBytes, csvBytes], { type: 'text/csv;charset=utf-8;' });
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = url; a.download = `${fileBase}.csv`; a.click();
         URL.revokeObjectURL(url);
       } else {
-        // Prefer xlsx-js-style for cell styling, fallback to xlsx if unavailable
-        let styled = true;
-        let mod: any;
+        // Use ExcelJS for reliable XLSX styling (dynamically imported so bundle remains small).
         try {
-          mod = await import('xlsx-js-style');
-        } catch {
-          styled = false;
-          mod = await import('xlsx');
-        }
-        const XLSX: any = (mod as any)?.default ?? mod;
-        const headers = ['storeId','storeName','location','transactionMonth','senderName','simCardsSold','faultySims','paymentAmount','remark','receiptCollectionDate','createdAt','status','clearance'];
-        const ws = XLSX.utils.json_to_sheet(data, { header: headers, skipHeader: false });
+          const ExcelJSMod: any = await import('exceljs');
+          const ExcelJS = ExcelJSMod.default ?? ExcelJSMod;
+          const wb = new ExcelJS.Workbook();
 
-        // Apply red/green fill on the Store Name cell based on clearance value
-        try {
-          const nameColIdx = headers.indexOf('storeName');
-          const encode_col = (idx: number) => {
-            if (XLSX.utils?.encode_col) return XLSX.utils.encode_col(idx);
-            // Fallback: convert 0-based index to Excel column name
-            let n = idx + 1; let s = '';
-            while (n > 0) { const r = (n - 1) % 26; s = String.fromCharCode(65 + r) + s; n = Math.floor((n - 1) / 26); }
-            return s;
-          };
-          const nameCol = encode_col(nameColIdx);
-          for (let i = 0; i < data.length; i++) {
-            const rowNum = i + 2; // +2 to skip header row
-            const clearance = String(data[i]?.clearance || '').toUpperCase();
-            const cellRef = `${nameCol}${rowNum}`;
-            const cell = ws[cellRef] || (ws[cellRef] = { t: 's', v: data[i]?.storeName ?? '' });
-            if (!cell.s) cell.s = {};
-            if (styled) {
-              if (clearance === 'NOT_CLEARED') {
-                cell.s.fill = { patternType: 'solid', fgColor: { rgb: 'FFFFC7CE' } }; // Excel light red
-              } else if (clearance === 'CLEARED') {
-                cell.s.fill = { patternType: 'solid', fgColor: { rgb: 'FFC6EFCE' } }; // Excel light green
-              }
+          const ws = wb.addWorksheet('Sales');
+          const headers = ['storeId','storeName','location','transactionMonth','senderName','simCardsSold','faultySims','paymentAmount','remark','receipts','clearance'];
+          ws.columns = headers.map(h => ({ header: h, key: h, width: 20 }));
+
+          // Prepare rows with NO emoji in clearance text
+          for (const r of data) {
+            const clearText = String(r.clearance || '').replace(/_/g,' ').toUpperCase().trim();
+            const rowObj: any = { ...r, clearance: clearText };
+            // Ensure we only include keys that match headers (drop status)
+            const filtered: any = {};
+            for (const h of headers) filtered[h] = rowObj[h] ?? '';
+            ws.addRow(filtered);
+          }
+
+          // Apply a light fill to the clearance column cells only
+          const clearCol = headers.indexOf('clearance') + 1; // 1-based
+          for (let i = 2; i <= ws.rowCount; i++) {
+            const cell = ws.getRow(i).getCell(clearCol);
+            const raw = String(cell.value || '').toUpperCase();
+            if (raw.includes('NOT')) {
+              cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFFE5E5' } };
+            } else if (raw.includes('CLEAR')) {
+              cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFE8F8EA' } };
             }
           }
-        } catch {}
 
-        const wb = XLSX.utils.book_new();
-        XLSX.utils.book_append_sheet(wb, ws, 'Sales');
-        XLSX.writeFile(wb, `${fileBase}.xlsx`);
+          // Generate buffer and trigger download
+          const buf = await wb.xlsx.writeBuffer();
+          const blob = new Blob([buf], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url; a.download = `${fileBase}.xlsx`; a.click();
+          URL.revokeObjectURL(url);
+        } catch (err) {
+          console.error('ExcelJS export failed, falling back to previous method', err);
+          // Fallback: try using xlsx library (best-effort)
+          try {
+            const mod: any = await import('xlsx');
+            const XLSX: any = (mod as any)?.default ?? mod;
+            const headers = ['storeId','storeName','location','transactionMonth','senderName','simCardsSold','faultySims','paymentAmount','remark','receipts','status','clearance'];
+            const dataForSheet = data.map((r:any) => ({ ...r, clearance: `${(String(r.clearance || '').toUpperCase().includes('NOT') ? '🔴 ' : String(r.clearance || '').toUpperCase().includes('CLEAR') ? '🟢 ' : '')}${String(r.clearance || '').replace(/_/g,' ')}`.trim() }));
+            const ws = XLSX.utils.json_to_sheet(dataForSheet, { header: headers, skipHeader: false });
+            const wb = XLSX.utils.book_new();
+            XLSX.utils.book_append_sheet(wb, ws, 'Sales');
+            const wbout = XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
+            const blob = new Blob([wbout], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url; a.download = `${fileBase}.xlsx`; a.click();
+            URL.revokeObjectURL(url);
+          } catch (e) {
+            console.error('Fallback XLSX export failed', e);
+            throw e;
+          }
+        }
       }
       setExportOpen(false);
     } catch (err:any) {
@@ -1421,10 +1728,10 @@ const SettingsView: React.FC<{ db?: any; isAuthReady?: boolean; appId?: string; 
         Settings
       </h1>
       <div className="bg-white p-6 rounded-xl shadow-lg border border-gray-100">
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-          <button onClick={() => { setImportOpen(true); resetImport(); }} className="w-full px-4 py-3 rounded-lg bg-purple-600 text-white font-semibold hover:bg-purple-700 transition">Import Stores</button>
-          <button onClick={() => { setExportOpen(true); setExportError(''); }} className="w-full px-4 py-3 rounded-lg bg-indigo-600 text-white font-semibold hover:bg-indigo-700 transition">Export Sales Report</button>
-          <button onClick={async () => { await handleDeleteAllStores(); }} className="w-full px-4 py-3 rounded-lg bg-red-600 text-white font-semibold hover:bg-red-700 transition">Delete All Stores</button>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <button onClick={() => { setImportOpen(true); resetImport(); }} className="w-auto px-4 py-2 rounded-md bg-purple-600 text-white font-semibold hover:bg-purple-700 transition">Import Stores</button>
+          <button onClick={() => { setExportOpen(true); setExportError(''); }} className="w-auto px-4 py-2 rounded-md bg-indigo-600 text-white font-semibold hover:bg-indigo-700 transition">Export Sales Report</button>
+          <button onClick={async () => { await handleDeleteAllStores(); }} className="w-auto px-4 py-2 rounded-md bg-red-600 text-white font-semibold hover:bg-red-700 transition">Delete All Stores</button>
         </div>
       </div>
 
@@ -1484,7 +1791,7 @@ const SettingsView: React.FC<{ db?: any; isAuthReady?: boolean; appId?: string; 
   );
 };
 
-const Sidebar: React.FC<{ currentView: View; setView: (view: View) => void }> = ({ currentView, setView }) => {
+const Sidebar: React.FC<{ currentView: View; setView: (view: View) => void; collapsed: boolean; onToggle: ()=>void }> = ({ currentView, setView, collapsed, onToggle }) => {
   const navItems = [
     { id: 'stores' as View, label: 'View Stores', icon: List },
     { id: 'visual' as View, label: 'View Visual', icon: BarChartIcon },
@@ -1501,12 +1808,19 @@ const Sidebar: React.FC<{ currentView: View; setView: (view: View) => void }> = 
   } as const;
 
   return (
-    <nav className="w-64 bg-gray-900 text-gray-100 flex-shrink-0 h-screen md:h-auto md:min-h-screen sticky top-0 md:relative p-6 hidden md:flex flex-col border-r border-gray-800 shadow-sm">
-      <div className="text-2xl font-bold mb-6 flex items-center">
-        <Store className="w-6 h-6 mr-2 text-gray-200" />
-        Sales Monitor
+    <nav className={`${collapsed ? 'w-16' : 'w-64'} fixed top-0 left-0 bg-gray-900 text-gray-100 h-screen px-3 py-4 md:px-4 md:py-6 hidden md:flex flex-col border-r border-gray-800 shadow-sm z-40 transition-[width] duration-200`}> 
+      <div className={`flex items-center ${collapsed ? 'justify-center' : ''} mb-3`}>
+        <Store className={`w-6 h-6 ${collapsed ? '' : 'mr-2'} text-gray-200`} />
+        {!collapsed && <span className="text-2xl font-bold">Sales Monitor</span>}
       </div>
-      <ul className="space-y-2">
+      <button onClick={onToggle} aria-label={collapsed ? 'Expand sidebar' : 'Collapse sidebar'} className={`mb-4 rounded-md bg-gray-800 text-gray-200 hover:bg-gray-700 ${collapsed ? 'w-10 h-10 flex items-center justify-center' : 'px-3 py-2 text-xs'}`}>
+        {collapsed ? (
+          <ChevronDown className="w-4 h-4 rotate-90" />
+        ) : (
+          'Collapse'
+        )}
+      </button>
+      <ul className="flex-1 space-y-2">
         {navItems.map((item) => {
           const isActive = currentView === item.id;
           const colors = colorMap[item.id];
@@ -1515,14 +1829,16 @@ const Sidebar: React.FC<{ currentView: View; setView: (view: View) => void }> = 
           const Icon = item.icon;
           return (
             <li key={item.id}>
-              <button onClick={() => setView(item.id)} className={`w-full flex items-center px-3 py-2 rounded-lg transition-colors duration-150 ${activeClass}`}>
-                <Icon className="w-5 h-5 mr-3" />
-                {item.label}
+              <button onClick={() => setView(item.id)} className={`w-full flex items-center ${collapsed ? 'justify-center' : ''} ${collapsed ? 'py-2' : 'px-3 py-2'} rounded-lg transition-colors duration-150 ${activeClass}`}>
+                <Icon className={`w-5 h-5 ${collapsed ? '' : 'mr-3'}`} />
+                {!collapsed && item.label}
               </button>
             </li>
           );
         })}
       </ul>
+      {/* bottom spacer to keep items centered nicely in collapsed view */}
+      <div className="mt-auto" />
     </nav>
   );
 };
@@ -1654,6 +1970,7 @@ const App: React.FC = () => {
           senderName: data.senderName,
           simCardsSold: data.simCardsSold,
           faultySims: data.faultySims,
+          receipts: data.receipts,
           paymentAmount: data.paymentAmount,
           status: data.status || 'Completed',
           createdAt: data.createdAt,
@@ -1700,8 +2017,21 @@ const App: React.FC = () => {
         }
       }
     } catch {/* ignore */}
+    // Proper calendar month ordering
+    const monthIndex: Record<string, number> = {
+      January: 0, February: 1, March: 2, April: 3, May: 4, June: 5,
+      July: 6, August: 7, September: 8, October: 9, November: 10, December: 11
+    };
     for (const key of Object.keys(m)) {
-      m[key].sort((a, b) => a.transactionMonth.localeCompare(b.transactionMonth));
+      m[key].sort((a, b) => {
+        const ai = monthIndex[a.transactionMonth] ?? 99;
+        const bi = monthIndex[b.transactionMonth] ?? 99;
+        if (ai !== bi) return ai - bi;
+        // tie-breaker: createdAt ascending
+        const ad = new Date(a.createdAt || 0).getTime();
+        const bd = new Date(b.createdAt || 0).getTime();
+        return ad - bd;
+      });
       // Apply optimistic overrides
       m[key] = m[key].map(tx => optimisticTxEdits[tx.id] ? { ...tx, ...optimisticTxEdits[tx.id] } : tx);
     }
@@ -1807,7 +2137,7 @@ const App: React.FC = () => {
               const txRef = doc(db, 'artifacts', appId, 'public', 'data', 'transactions', existing.id);
               const payload: any = { senderName: p.senderName, simCardsSold: p.simCardsSold, paymentAmount: p.paymentAmount, remark: p.remark };
               if (p.faultySims !== undefined) payload.faultySims = p.faultySims;
-              if (p.receiptCollectionDate) payload.receiptCollectionDate = p.receiptCollectionDate;
+              if (p.receiptCollectionDate) payload.receiptCollectionDate = toDDMMYY(p.receiptCollectionDate);
               if (p.clearance) payload.clearance = p.clearance;
               await updateDoc(txRef, payload);
               const delta = p.paymentAmount - (prev.paymentAmount || 0);
@@ -1818,7 +2148,7 @@ const App: React.FC = () => {
             } else {
               // Create new
               const newRef = doc(transactionsCollectionRef);
-              await setDoc(newRef, { ...p, id: newRef.id });
+              await setDoc(newRef, { ...p, id: newRef.id, receiptCollectionDate: p.receiptCollectionDate ? toDDMMYY(p.receiptCollectionDate) : undefined });
               const storeRef = doc(db, 'artifacts', appId, 'public', 'data', 'stores', p.storeId);
               await updateDoc(storeRef, { totalRevenue: increment(p.paymentAmount), entries: increment(1) });
             }
@@ -1869,10 +2199,15 @@ const App: React.FC = () => {
     }
   }, [currentView, displayStores, stores, db, isAuthReady]);
 
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   return (
-    <div className="flex min-h-screen bg-gray-50">
-      <Sidebar currentView={currentView} setView={setCurrentView} />
-      <main className="flex-1 overflow-y-auto w-full">{renderContent()}</main>
+    <div className="min-h-screen bg-gray-50">
+      <Sidebar currentView={currentView} setView={setCurrentView} collapsed={sidebarCollapsed} onToggle={()=> setSidebarCollapsed(c=> !c)} />
+      <main
+        className={`flex-1 transition-[margin,width] duration-200 overflow-y-auto overflow-x-hidden box-border w-full ${sidebarCollapsed ? 'md:ml-16 md:w-[calc(100%-4rem)]' : 'md:ml-64 md:w-[calc(100%-16rem)]'}`}
+      >
+        {renderContent()}
+      </main>
     </div>
   );
 };
