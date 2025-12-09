@@ -189,7 +189,7 @@ const StoreAccordion: React.FC<{ store: StoreData; isExpanded: boolean; onToggle
     return localTx.reduce((sum, t) => sum + (typeof t.paymentAmount === 'number' ? t.paymentAmount : 0), 0);
   }, [localTx]);
 
-
+// Rename store handler
   const handleRenameStore = async () => {
     const newName = window.prompt('Enter new store name', store.name);
     if (!newName) return;
