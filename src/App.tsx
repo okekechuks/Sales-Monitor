@@ -1,5 +1,5 @@
 import React, { useState, useMemo, useCallback, useEffect } from 'react';
-import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, PieChart, Pie, Cell, Legend, ResponsiveContainer } from 'recharts';
+import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, PieChart, Pie, Cell, Legend, ResponsiveContainer, LabelList } from 'recharts';
 import { DollarSign, TrendingUp, BarChart as BarChartIcon, Clock, PlusSquare, Settings, Store, CreditCard, Search, ChevronDown, List, Plus, User, Trash, Pencil, CheckCircle2, XCircle, AlertTriangle } from 'lucide-react';
 // (merged into single import above)
 import { initializeApp } from 'firebase/app';
@@ -982,7 +982,7 @@ const VisualView: React.FC<{ stores: StoreData[]; transactionsByStore: Record<st
                   tickFormatter={(name: string) => name.length > 18 ? name.slice(0, 18) + '…' : name}
                 />
                 <YAxis tick={{ fill: '#6b7280' }} tickFormatter={(v)=> formatNaira(Number(v),'short')} />
-                <Tooltip contentStyle={{ backgroundColor: '#fff', border: '1px solid #e5e7eb', borderRadius: 8 }} formatter={(v:any, _name:any, props:any)=> [formatNaira(Number(v),'full'), props?.payload?.name || 'Revenue'] } />
+                <Tooltip contentStyle={{ backgroundColor: '#fff', border: '1px solid #e5e7eb', borderRadius: 8 }} formatter={(v:any) => formatNaira(Number(v),'full')} labelFormatter={(label:any) => String(label)} />
                 <Legend verticalAlign="bottom" wrapperStyle={{ color: '#374151' }} />
                 <Bar dataKey="value" maxBarSize={56} radius={[6,6,0,0]}>
                   <LabelList
@@ -1030,7 +1030,7 @@ const VisualView: React.FC<{ stores: StoreData[]; transactionsByStore: Record<st
                     <Cell key={`cell-${index}`} fill={["#4f46e5","#22c55e","#ef4444","#f59e0b","#06b6d4","#a855f7","#64748b","#14b8a6","#f97316","#84cc16"][index % 10]} />
                   ))}
                 </Pie>
-                <Tooltip contentStyle={{ backgroundColor: '#fff', border: '1px solid #e5e7eb', borderRadius: 8 }} formatter={(v:any, _name:any, props:any)=> [formatNaira(Number(v),'full'), props?.payload?.name || 'Revenue'] } />
+                <Tooltip contentStyle={{ backgroundColor: '#fff', border: '1px solid #e5e7eb', borderRadius: 8 }} formatter={(v:any) => formatNaira(Number(v),'full')} labelFormatter={(label:any) => String(label)} />
                 <Legend verticalAlign="bottom" wrapperStyle={{ color: '#374151' }} />
               </PieChart>
             </ResponsiveContainer>
