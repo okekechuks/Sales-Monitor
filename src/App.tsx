@@ -177,6 +177,10 @@ const StoreDetailRow: React.FC<{ store: StoreData; onDelete: (store: StoreData) 
 const StoreAccordion: React.FC<{ store: StoreData; isExpanded: boolean; onToggle: () => void; onDelete: (store: StoreData) => void; onEditLocation: (store: StoreData) => void; transactions?: Transaction[]; db?: any; isAuthReady?: boolean; appId?: string }> = ({ store, isExpanded, onToggle, onDelete, onEditLocation, transactions = [], db, isAuthReady, appId }) => {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [localTx, setLocalTx] = useState<Transaction[]>(transactions);
+  // Keep localTx in sync when parent updates transactions (e.g., after import or snapshot)
+  useEffect(() => {
+    setLocalTx(transactions);
+  }, [transactions]);
   const [editFields, setEditFields] = useState<{ senderName: string; simCardsSold: string; faultySims: string; paymentAmount: string; clearance: 'CLEARED' | 'NOT_CLEARED' }>(
     { senderName: '', simCardsSold: '', faultySims: '', paymentAmount: '', clearance: 'NOT_CLEARED' }
   );
@@ -482,6 +486,8 @@ const StoreAccordion: React.FC<{ store: StoreData; isExpanded: boolean; onToggle
           </div>
         </div>
       )}
+
+      
     </div>
     {receiptModal.open ? (
       <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
@@ -682,13 +688,20 @@ const StoresListView: React.FC<{ stores: StoreData[]; db?: any; isAuthReady?: bo
   }, []);
 
   const filteredStores = useMemo(() => {
-    return stores.filter((store) =>
-      store.name.toLowerCase().includes(searchText.toLowerCase()) ||
-      store.owner.toLowerCase().includes(searchText.toLowerCase()) ||
-      store.email.toLowerCase().includes(searchText.toLowerCase()) ||
-      store.location.toLowerCase().includes(searchText.toLowerCase())
-    );
-  }, [searchText, stores]);
+    const q = searchText.toLowerCase().trim();
+    if (!q) return stores;
+    return stores.filter((store) => {
+      if (store.name.toLowerCase().includes(q) ||
+          store.owner.toLowerCase().includes(q) ||
+          store.email.toLowerCase().includes(q) ||
+          store.location.toLowerCase().includes(q)) return true;
+      // also search senderName inside transactions for this store
+      try {
+        const txs = (transactionsByStore && transactionsByStore[store.id]) || [];
+        return txs.some(t => (t.senderName || '').toLowerCase().includes(q));
+      } catch { return false; }
+    });
+  }, [searchText, stores, transactionsByStore]);
 
 
   const monthFilteredTxByStore = useMemo(() => {
@@ -1377,6 +1390,12 @@ const SettingsView: React.FC<{ db?: any; isAuthReady?: boolean; appId?: string; 
   const [exporting, setExporting] = useState(false);
   const [exportError, setExportError] = useState<string>('');
   const [importOpen, setImportOpen] = useState(false);
+  const [importReportsOpen, setImportReportsOpen] = useState(false);
+  const [reportFileInfo, setReportFileInfo] = useState<string>('');
+  const [parsedReportRows, setParsedReportRows] = useState<any[]>([]);
+  const [importingReports, setImportingReports] = useState(false);
+  const [reportImportReport, setReportImportReport] = useState<{ created: number; queued: number; skipped: number; errors: string[] }>({ created: 0, queued: 0, skipped: 0, errors: [] });
+  const [reportImportMonth, setReportImportMonth] = useState(MONTH_ONLY_OPTIONS[new Date().getMonth()]?.value || 'January');
 
   const resetImport = () => {
     setParsedRows([]);
@@ -1389,22 +1408,246 @@ const SettingsView: React.FC<{ db?: any; isAuthReady?: boolean; appId?: string; 
     if (!file) return;
     resetImport();
     setFileInfo(`${file.name} (${Math.round(file.size/1024)} KB)`);
-    const isXLSX = file.name.toLowerCase().endsWith('.xlsx') || file.name.toLowerCase().endsWith('.xls');
-    if (!isXLSX) {
-      setImportReport(r => ({ ...r, errors: [...r.errors, 'Unsupported file type. Upload an Excel file (.xlsx or .xls) with a single column of store names.'] }));
-      return;
-    }
+    const name = file.name.toLowerCase();
+    const isXLSX = name.endsWith('.xlsx') || name.endsWith('.xls');
+    const isCSV = name.endsWith('.csv');
     try {
-      const data = await file.arrayBuffer();
       const XLSX = await import('xlsx');
-      const wb = XLSX.read(data, { type: 'array' });
-      const sheetName = wb.SheetNames[0];
-      const sheet = wb.Sheets[sheetName];
-      const json: any[] = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '' });
-      processExcelNameList(json);
+      let rows: any[] = [];
+      if (isXLSX) {
+        const data = await file.arrayBuffer();
+        const wb = XLSX.read(data, { type: 'array' });
+        const sheet = wb.Sheets[wb.SheetNames[0]];
+        rows = XLSX.utils.sheet_to_json(sheet, { defval: '' });
+      } else if (isCSV) {
+        const text = await file.text();
+        // Try parsing CSV into a workbook then to json rows
+        const wb = XLSX.read(text, { type: 'string' });
+        const sheet = wb.Sheets[wb.SheetNames[0]];
+        rows = XLSX.utils.sheet_to_json(sheet, { defval: '' });
+      } else {
+        setImportReport(r => ({ ...r, errors: [...r.errors, 'Unsupported file type. Upload an Excel (.xlsx/.xls) or CSV file.'] }));
+        return;
+      }
+
+      // If rows look like objects with multiple keys treat as transactions and show in report-import preview
+      if (rows.length > 0 && typeof rows[0] === 'object' && Object.keys(rows[0]).length > 1) {
+        setParsedReportRows(rows);
+        setImportReportsOpen(true);
+      } else {
+        // Fallback: treat as simple name list (header:1)
+        const arr = XLSX.utils.sheet_to_json((XLSX.utils.json_to_sheet(rows) as any), { header: 1, defval: '' });
+        processExcelNameList(arr as any[]);
+      }
     } catch (err: any) {
       console.error('Import parse error:', err);
       setImportReport(r => ({ ...r, errors: [...r.errors, 'Failed to parse file.'] }));
+    }
+  };
+
+  const handleReportFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setParsedReportRows([]);
+    setReportFileInfo(`${file.name} (${Math.round(file.size/1024)} KB)`);
+    const name = file.name.toLowerCase();
+    const isXLSX = name.endsWith('.xlsx') || name.endsWith('.xls');
+    const isCSV = name.endsWith('.csv');
+    try {
+      const XLSX = await import('xlsx');
+      let rows: any[] = [];
+      if (isXLSX) {
+        const data = await file.arrayBuffer();
+        const wb = XLSX.read(data, { type: 'array' });
+        const sheet = wb.Sheets[wb.SheetNames[0]];
+        rows = XLSX.utils.sheet_to_json(sheet, { defval: '' });
+      } else if (isCSV) {
+        const text = await file.text();
+        const wb = XLSX.read(text, { type: 'string' });
+        const sheet = wb.Sheets[wb.SheetNames[0]];
+        rows = XLSX.utils.sheet_to_json(sheet, { defval: '' });
+      } else {
+        setReportImportReport(r => ({ ...r, errors: [...r.errors, 'Unsupported file type. Upload CSV or Excel (.xlsx/.xls).'] }));
+        return;
+      }
+      setParsedReportRows(rows);
+    } catch (err:any) {
+      console.error('Report parse error:', err);
+      setReportImportReport(r => ({ ...r, errors: [...r.errors, 'Failed to parse report file.'] }));
+    }
+  };
+
+  const parseReceiptsField = (raw: string) => {
+    if (!raw) return [];
+    try {
+      const parts = String(raw).split('||').map(s => s.trim()).filter(Boolean);
+      const out: Array<{ date: string; note?: string }> = [];
+      for (const p of parts) {
+        const m = p.match(/^(\d{1,2}-\d{1,2}-\d{2,4})(?:\s+(.*))?$/);
+        if (m) out.push({ date: m[1], note: m[2] || '' });
+        else out.push({ date: p, note: '' });
+      }
+      return out;
+    } catch { return []; }
+  };
+
+  const performReportImport = async () => {
+    if (!parsedReportRows.length) return;
+    setImportingReports(true);
+    const report = { created: 0, queued: 0, skipped: 0, errors: [] as string[] };
+    try {
+      const nameToStoreId = new Map<string,string>(stores.map(s => [ (s.name||'').toLowerCase(), s.id ]));
+      const txRows = parsedReportRows;
+      const newCreatedStores: any[] = [];
+      const newCreatedTxs: any[] = [];
+      if (!db || !isAuthReady || !appId) {
+        // Queue offline
+        const raw = localStorage.getItem('pending_payments');
+        const list = raw ? JSON.parse(raw) : [];
+        const additions: any[] = [];
+        // load pending stores once so we can ensure local- ids referenced in rows exist
+        const rawStores = localStorage.getItem('pending_stores');
+        const listStores: any[] = rawStores ? JSON.parse(rawStores) : [];
+        for (const r of txRows) {
+          const rowLower: Record<string, any> = {};
+          for (const k of Object.keys(r)) rowLower[k.trim().toLowerCase().replace(/\s+/g,'')] = r[k];
+          let storeId = (rowLower['storeid'] || '') || ((rowLower['storename'] && nameToStoreId.get(String(rowLower['storename']).toLowerCase())) || '');
+          // If the row references a local- storeId that isn't in pending_stores yet, create a pending store entry so it appears in displayStores
+          if (storeId && String(storeId).startsWith('local-')) {
+            const exists = Array.isArray(listStores) && listStores.find(s => s && s.id === storeId);
+            if (!exists) {
+              const newStore = { id: storeId, name: String(rowLower['storename'] || '').trim() || 'Imported Store', owner: rowLower['owner'] || 'Imported', email: rowLower['email'] || '', location: rowLower['location'] || 'Imported', totalRevenue: 0, entries: 0, createdAt: new Date().toISOString(), offline: true };
+              listStores.push(newStore);
+              // record queued store for diagnostics/optimistic view
+              newCreatedStores.push(newStore);
+            }
+          }
+          // Auto-create local store when storeName exists but no mapping found
+          if (!storeId && rowLower['storename']) {
+            const newStoreId = `local-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+            const newStore = { id: newStoreId, name: String(rowLower['storename'] || '').trim(), owner: rowLower['owner'] || 'Imported', email: rowLower['email'] || '', location: rowLower['location'] || 'Imported', totalRevenue: 0, entries: 0, createdAt: new Date().toISOString(), offline: true };
+            // append to pending_stores queue
+            try {
+              // append to pending_stores queue (we already have listStores loaded)
+              try {
+                // only add if not already present (double-check)
+                const already = listStores.find((s:any) => s && s.id === newStore.id);
+                if (!already) listStores.push(newStore);
+              } catch {}
+            } catch {}
+            nameToStoreId.set(String(newStore.name).toLowerCase(), newStoreId);
+            storeId = newStoreId;
+            // record queued store for diagnostics
+            newCreatedStores.push(newStore);
+          }
+          if (!storeId) { report.errors.push('Missing storeId or unknown storeName'); report.skipped++; continue; }
+          const paymentAmount = Number(rowLower['paymentamount'] ?? rowLower['amount'] ?? 0) || 0;
+          const simCardsSold = Number(rowLower['simcardssold'] ?? 0) || 0;
+          const faultySims = rowLower['faultysims'] === '' ? undefined : (Number(rowLower['faultysims']) || undefined);
+          const remark = rowLower['remark'] || '';
+          const receipts = parseReceiptsField(rowLower['receipts'] || '');
+          const transactionMonth = (rowLower['transactionmonth'] || reportImportMonth || '').toString();
+          // Skip duplicate month imports for same store (check pending + newly created in this import)
+          try {
+            const existingPending = (Array.isArray(list) ? list : []).some((p: any) => p.storeId === storeId && String(p.transactionMonth) === transactionMonth);
+            const existingNew = newCreatedTxs.some((p: any) => p.storeId === storeId && String(p.transactionMonth) === transactionMonth);
+            if (existingPending || existingNew) { report.skipped++; continue; }
+          } catch {}
+          const status = rowLower['status'] || 'Completed';
+          const clearance = (String(rowLower['clearance'] || '').toUpperCase() || '');
+          const offlinePayment = { id: `local-pay-${Date.now()}-${Math.random().toString(36).slice(2)}`, storeId, senderName: rowLower['sendername']||'', simCardsSold, faultySims, paymentAmount, transactionMonth, remark, receipts, status, clearance, createdAt: new Date().toISOString(), offline: true };
+          additions.push(offlinePayment);
+          newCreatedTxs.push(offlinePayment);
+          report.queued++;
+        }
+        // persist any stores we may have added and notify
+        try {
+          localStorage.setItem('pending_stores', JSON.stringify(listStores));
+          window.dispatchEvent(new Event('pendingStoresUpdated'));
+        } catch {}
+        localStorage.setItem('pending_payments', JSON.stringify([...(Array.isArray(list)? list: []), ...additions]));
+        window.dispatchEvent(new Event('pendingPaymentsUpdated'));
+        // Notify app to optimistically show created/queued items
+        try {
+          console.log('Import (offline) queued stores:', newCreatedStores.map(s=>s.id), 'queued txs:', newCreatedTxs.map(t=>t.id));
+          window.dispatchEvent(new CustomEvent('importCreated', { detail: { createdStores: newCreatedStores, createdTxs: newCreatedTxs } }));
+        } catch (evErr) { console.warn('Failed to dispatch importCreated event for offline import:', evErr); }
+      } else {
+        const batch = writeBatch(db);
+        const txRef = collection(db, 'artifacts', appId, 'public', 'data', 'transactions');
+        const storesCollectionRef = collection(db, 'artifacts', appId, 'public', 'data', 'stores');
+        for (const r of txRows) {
+          const rowLower: Record<string, any> = {};
+          for (const k of Object.keys(r)) rowLower[k.trim().toLowerCase().replace(/\s+/g,'')] = r[k];
+          let storeId = (rowLower['storeid'] || '') || ((rowLower['storename'] && nameToStoreId.get(String(rowLower['storename']).toLowerCase())) || '');
+          // If a row references a local- id but we're online, create a remote store and map the local id to the new remote id for this import
+          if (storeId && String(storeId).startsWith('local-')) {
+            const storeNameCheck = String(rowLower['storename'] || '').trim();
+            const newStoreRefLocal = doc(storesCollectionRef);
+            const newStorePayloadLocal = { id: newStoreRefLocal.id, name: storeNameCheck || 'Imported', owner: rowLower['owner'] || 'Imported', email: rowLower['email'] || '', location: rowLower['location'] || 'Imported', totalRevenue: 0, entries: 0, createdAt: new Date().toISOString() };
+            batch.set(newStoreRefLocal, newStorePayloadLocal);
+            nameToStoreId.set((storeNameCheck || '').toLowerCase(), newStoreRefLocal.id);
+            storeId = newStoreRefLocal.id;
+            newCreatedStores.push(newStorePayloadLocal);
+          }
+          // Auto-create remote store when online and storeName present but unknown
+          if (!storeId && rowLower['storename']) {
+            const storeName = String(rowLower['storename'] || '').trim();
+            const newStoreRef = doc(storesCollectionRef);
+            const newStorePayload = { id: newStoreRef.id, name: storeName, owner: rowLower['owner'] || 'Imported', email: rowLower['email'] || '', location: rowLower['location'] || 'Imported', totalRevenue: 0, entries: 0, createdAt: new Date().toISOString() };
+            batch.set(newStoreRef, newStorePayload);
+            nameToStoreId.set(storeName.toLowerCase(), newStoreRef.id);
+            storeId = newStoreRef.id;
+            // remember newly created store for optimistic UI update
+            newCreatedStores.push(newStorePayload);
+          }
+          if (!storeId) { report.errors.push('Missing storeId or unknown storeName'); report.skipped++; continue; }
+          const paymentAmount = Number(rowLower['paymentamount'] ?? rowLower['amount'] ?? 0) || 0;
+          const simCardsSold = Number(rowLower['simcardssold'] ?? 0) || 0;
+          const faultySims = rowLower['faultysims'] === '' ? undefined : (Number(rowLower['faultysims']) || undefined);
+          const remark = rowLower['remark'] || '';
+          const receipts = parseReceiptsField(rowLower['receipts'] || '');
+          const transactionMonth = (rowLower['transactionmonth'] || reportImportMonth || '').toString();
+          // Skip duplicates: check already-scheduled in this batch
+          if (newCreatedTxs.some((p:any) => p.storeId === storeId && String(p.transactionMonth) === transactionMonth)) { report.skipped++; continue; }
+          // Also check remote existing transaction for the same store+month
+          try {
+            const q = query(txRef, where('storeId', '==', storeId), where('transactionMonth', '==', transactionMonth));
+            const snap = await getDocs(q);
+            if (!snap.empty) { report.skipped++; continue; }
+          } catch (remoteCheckErr) {
+            // ignore remote check failure and proceed (will likely be caught by batch.commit)
+            console.warn('Failed to check remote duplicates for', storeId, transactionMonth, remoteCheckErr);
+          }
+          const status = rowLower['status'] || 'Completed';
+          const clearance = (String(rowLower['clearance'] || '').toUpperCase() || '');
+          const docRef = doc(txRef);
+          const payload = { id: docRef.id, storeId, senderName: rowLower['sendername']||'', simCardsSold, faultySims, paymentAmount, transactionMonth, remark, receipts, status, clearance, createdAt: new Date().toISOString() } as any;
+          batch.set(docRef, payload);
+          // remember tx for optimistic UI update
+          newCreatedTxs.push(payload);
+          report.created++;
+        }
+        await batch.commit();
+        // Dispatch an event so the outer component (which owns React state) can optimistically update UI
+        try {
+          window.dispatchEvent(new CustomEvent('importCreated', { detail: { createdStores: newCreatedStores, createdTxs: newCreatedTxs } }));
+        } catch (evErr) { console.warn('Failed to dispatch importCreated event:', evErr); }
+      }
+      // Populate diagnostics for the import report and log created/queued ids
+      try {
+        report.createdStoreIds = newCreatedStores.map((s:any) => s.id);
+        report.createdTxIds = newCreatedTxs.map((t:any) => t.id);
+        report.queuedStoreIds = newCreatedStores.filter((s:any) => String(s.id).startsWith('local-')).map((s:any)=>s.id);
+        report.queuedTxIds = newCreatedTxs.filter((t:any) => String(t.id).startsWith('local-pay-')).map((t:any)=>t.id);
+        console.log('Import diagnostics - createdStores:', report.createdStoreIds, 'createdTxs:', report.createdTxIds, 'queuedStores:', report.queuedStoreIds, 'queuedTxs:', report.queuedTxIds);
+      } catch (diagErr) { console.warn('Failed populating import diagnostics:', diagErr); }
+    } catch (err:any) {
+      console.error('Import processing failed:', err);
+      report.errors.push('Import failed. See console.');
+    } finally {
+      setReportImportReport(report);
+      setImportingReports(false);
     }
   };
 
@@ -1730,6 +1973,7 @@ const SettingsView: React.FC<{ db?: any; isAuthReady?: boolean; appId?: string; 
       <div className="bg-white p-6 rounded-xl shadow-lg border border-gray-100">
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
           <button onClick={() => { setImportOpen(true); resetImport(); }} className="w-auto px-4 py-2 rounded-md bg-purple-600 text-white font-semibold hover:bg-purple-700 transition">Import Stores</button>
+          <button onClick={() => { setImportReportsOpen(true); setReportFileInfo(''); setParsedReportRows([]); setReportImportReport({ created: 0, queued: 0, skipped: 0, errors: [] }); }} className="w-auto px-4 py-2 rounded-md bg-green-600 text-white font-semibold hover:bg-green-700 transition">Import Sales Report</button>
           <button onClick={() => { setExportOpen(true); setExportError(''); }} className="w-auto px-4 py-2 rounded-md bg-indigo-600 text-white font-semibold hover:bg-indigo-700 transition">Export Sales Report</button>
           <button onClick={async () => { await handleDeleteAllStores(); }} className="w-auto px-4 py-2 rounded-md bg-red-600 text-white font-semibold hover:bg-red-700 transition">Delete All Stores</button>
         </div>
@@ -1756,33 +2000,133 @@ const SettingsView: React.FC<{ db?: any; isAuthReady?: boolean; appId?: string; 
       )}
 
       {importOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
-          <div className="bg-white rounded-xl shadow-lg border border-gray-200 w-[95%] max-w-lg p-6">
-            <h3 className="text-lg font-semibold text-gray-900 mb-3">Import Stores (Excel)</h3>
-            <p className="text-sm text-gray-600 mb-4">Upload an Excel sheet (.xlsx or .xls) with a single column of store names.</p>
-            <input type="file" accept=".xlsx,.xls" onChange={handleFile} className="block w-full text-sm text-gray-700 file:mr-4 file:py-2 file:px-4 file:rounded-md file:border-0 file:text-sm file:font-semibold file:bg-purple-50 file:text-purple-700 hover:file:bg-purple-100" />
-            {fileInfo && <p className="mt-2 text-xs text-gray-500">Loaded: {fileInfo}</p>}
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4">
+          <div className="bg-white rounded-xl shadow-lg border border-gray-200 w-full max-w-lg p-4 md:p-6">
+            <div className="flex items-start justify-between gap-4">
+              <div>
+                <h3 className="text-lg font-semibold text-gray-900">Import Stores</h3>
+                <p className="text-sm text-gray-600">Upload an Excel file (.xlsx/.xls) with a column of store names.</p>
+              </div>
+              <div className="flex items-start gap-2">
+                <button aria-label="Close import" onClick={() => setImportOpen(false)} className="rounded-md text-gray-500 hover:text-gray-700 p-1">
+                  ✕
+                </button>
+              </div>
+            </div>
+
+            <label htmlFor="store-file" className="mt-4 block cursor-pointer">
+              <div className="border-2 border-dashed border-gray-200 rounded-md p-4 flex items-center gap-3 hover:border-gray-300 transition">
+                <div className="text-sm text-gray-700">Choose a file</div>
+                <div className="ml-auto text-xs text-gray-500">Accepts: .xlsx, .xls</div>
+              </div>
+            </label>
+            <input id="store-file" type="file" accept=".xlsx,.xls" onChange={handleFile} className="sr-only" />
+
+            {fileInfo && <p className="mt-3 text-xs text-gray-500">Loaded: <span className="font-medium text-gray-700">{fileInfo}</span></p>}
+
             {parsedRows.length > 0 && (
               <div className="mt-3 p-3 rounded-md bg-gray-50 border text-xs text-gray-700">
-                <div>Total rows parsed: <span className="font-semibold">{parsedRows.length}</span></div>
-                <div>Duplicates will be skipped during import.</div>
+                <div className="flex items-center justify-between">
+                  <div>Total rows parsed: <span className="font-semibold">{parsedRows.length}</span></div>
+                  <div className="text-xs text-gray-500">Duplicates will be skipped</div>
+                </div>
               </div>
             )}
+
             {(importReport.created || importReport.queued || importReport.skipped || importReport.errors.length) && (
               <div className="mt-3 p-3 rounded-md bg-indigo-50 border border-indigo-200 text-sm text-indigo-900 space-y-1">
-                <div><span className="font-semibold">Created (remote):</span> {importReport.created}</div>
-                <div><span className="font-semibold">Queued (offline):</span> {importReport.queued}</div>
-                <div><span className="font-semibold">Skipped (duplicates):</span> {importReport.skipped}</div>
-                {importReport.errors.map((er,i)=>(<div key={i} className="text-red-600">Error: {er}</div>))}
+                <div className="grid grid-cols-3 gap-2 text-xs">
+                  <div><span className="font-semibold">Created:</span> {importReport.created}</div>
+                  <div><span className="font-semibold">Queued:</span> {importReport.queued}</div>
+                  <div><span className="font-semibold">Skipped:</span> {importReport.skipped}</div>
+                </div>
+                {importReport.errors.map((er,i)=>(<div key={i} className="text-red-600 text-xs">Error: {er}</div>))}
               </div>
             )}
+
             <div className="mt-4 flex items-center justify-end gap-3">
-              <button onClick={() => setImportOpen(false)} className="px-4 py-2 rounded-md bg-gray-200 text-gray-700 hover:bg-gray-300">Close</button>
-              <button type="button" onClick={() => {
-                // Generate a tiny Excel file client-side is complex; provide guidance instead
-                alert('Prepare an Excel sheet with a single column titled "Name" and list store names under it.');
-              }} className="px-4 py-2 rounded-md bg-green-600 text-white hover:bg-green-700">Excel Format Guide</button>
-              <button disabled={!parsedRows.length || importing} onClick={performImport} className={`px-4 py-2 rounded-md text-white ${importing? 'bg-purple-400':'bg-purple-600 hover:bg-purple-700'} disabled:opacity-50`}>{importing? 'Importing...' : 'Import'}</button>
+              <button onClick={() => setImportOpen(false)} className="px-3 py-2 rounded-md bg-gray-100 text-gray-700 hover:bg-gray-200">Close</button>
+              <button type="button" onClick={() => { alert('Prepare an Excel sheet with a single column titled "Name" and list store names under it.'); }} className="px-3 py-2 rounded-md bg-white border border-green-600 text-green-700 hover:bg-green-50">Format Guide</button>
+              <button disabled={!parsedRows.length || importing} onClick={performImport} className={`px-3 py-2 rounded-md text-white ${importing? 'bg-purple-400':'bg-purple-600 hover:bg-purple-700'} disabled:opacity-50`} aria-disabled={!parsedRows.length || importing}>{importing? 'Importing...' : 'Import'}</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {importReportsOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4">
+          <div className="bg-white rounded-xl shadow-lg border border-gray-200 w-full max-w-2xl p-4 md:p-6">
+            <div className="flex items-start justify-between">
+              <div>
+                <h3 className="text-lg font-semibold text-gray-900">Import Sales Report</h3>
+                <p className="text-sm text-gray-600">Upload a CSV or Excel file with transactions. Expected columns: storeId or storeName, transactionMonth, senderName, simCardsSold, faultySims, paymentAmount, remark, receipts, status, clearance.</p>
+              </div>
+              <div>
+                <button aria-label="Close report import" onClick={() => setImportReportsOpen(false)} className="rounded-md text-gray-500 hover:text-gray-700 p-1">✕</button>
+              </div>
+            </div>
+
+            <label htmlFor="report-file" className="mt-4 block cursor-pointer">
+              <div className="border-2 border-dashed border-gray-200 rounded-md p-4 flex items-center gap-3 hover:border-gray-300 transition">
+                <div className="text-sm text-gray-700">Choose CSV or Excel file</div>
+                <div className="ml-auto text-xs text-gray-500">Accepts: .csv, .xlsx, .xls</div>
+              </div>
+            </label>
+            <input id="report-file" type="file" accept=".xlsx,.xls,.csv" onChange={handleReportFile} className="sr-only" />
+
+            <div className="mt-3 grid grid-cols-1 md:grid-cols-3 gap-3">
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">Assign Month</label>
+                <select value={reportImportMonth} onChange={(e)=>setReportImportMonth(e.target.value)} className="w-full px-3 py-2 border rounded-md">
+                  {MONTH_ONLY_OPTIONS.map(m => (
+                    <option key={m.value} value={m.value}>{m.label}</option>
+                  ))}
+                </select>
+              </div>
+              <div className="col-span-2 text-sm text-gray-500 flex items-center">{reportFileInfo ? (<span className="text-xs">Loaded: <span className="font-medium text-gray-700">{reportFileInfo}</span></span>) : 'No file selected'}</div>
+            </div>
+
+            {parsedReportRows.length > 0 && (
+              <div className="mt-3 p-3 rounded-md bg-gray-50 border text-xs text-gray-700">
+                <div className="flex items-center justify-between">
+                  <div>Total rows parsed: <span className="font-semibold">{parsedReportRows.length}</span></div>
+                  <div className="text-xs text-gray-500">Preview (first 5 rows)</div>
+                </div>
+                <div className="mt-2 overflow-auto max-h-44 border rounded-md">
+                  <table className="min-w-full text-xs border-collapse">
+                    <thead className="bg-white sticky top-0">
+                      <tr>
+                        {Object.keys(parsedReportRows[0] || {}).slice(0,8).map((h,i)=> (<th key={i} className="px-2 py-1 text-left border-b">{h}</th>))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {parsedReportRows.slice(0,5).map((r: any,ri:number)=>(
+                        <tr key={ri} className="odd:bg-white even:bg-gray-50">
+                          {Object.keys(r).slice(0,8).map((k,ci)=>(<td key={ci} className="px-2 py-1 align-top">{String(r[k])}</td>))}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+
+            {(reportImportReport.created || reportImportReport.queued || reportImportReport.skipped || reportImportReport.errors.length) && (
+              <div className="mt-3 p-3 rounded-md bg-yellow-50 border border-yellow-200 text-sm text-yellow-900 space-y-1">
+                <div className="grid grid-cols-3 gap-2 text-xs">
+                  <div><span className="font-semibold">Created:</span> {reportImportReport.created}</div>
+                  <div><span className="font-semibold">Queued:</span> {reportImportReport.queued}</div>
+                  <div><span className="font-semibold">Skipped:</span> {reportImportReport.skipped}</div>
+                </div>
+                {reportImportReport.errors.map((er:any,i:number)=>(<div key={i} className="text-red-600 text-xs">Error: {er}</div>))}
+                {/* Debug details hidden by default */}
+              </div>
+            )}
+
+            <div className="mt-4 flex items-center justify-end gap-3">
+              <button onClick={() => setImportReportsOpen(false)} className="px-3 py-2 rounded-md bg-gray-100 text-gray-700 hover:bg-gray-200">Close</button>
+              <button type="button" onClick={() => { alert('Prepare a CSV/Excel with columns: storeId or storeName, transactionMonth, senderName, simCardsSold, faultySims, paymentAmount, remark, receipts (use " || " to separate), status, clearance'); }} className="px-3 py-2 rounded-md bg-white border border-green-600 text-green-700 hover:bg-green-50">Format Guide</button>
+              <button disabled={!parsedReportRows.length || importingReports} onClick={performReportImport} className={`px-3 py-2 rounded-md text-white ${importingReports? 'bg-yellow-400':'bg-yellow-600 hover:bg-yellow-700'} disabled:opacity-50`} aria-disabled={!parsedReportRows.length || importingReports}>{importingReports? 'Importing...' : 'Import Report'}</button>
             </div>
           </div>
         </div>
@@ -1854,10 +2198,55 @@ const App: React.FC = () => {
   const [db, setDb] = useState<any>(null);
   const [isAuthReady, setIsAuthReady] = useState(false);
   const [stores, setStores] = useState<StoreData[]>([]);
+  const [optimisticStores, setOptimisticStores] = useState<StoreData[]>([]);
   const [pendingVersion, setPendingVersion] = useState(0);
   const [transactions, setTransactions] = useState<Transaction[]>([]);
+  const [optimisticTxs, setOptimisticTxs] = useState<Transaction[]>([]);
   const [pendingPaymentsVersion, setPendingPaymentsVersion] = useState(0);
   const [optimisticTxEdits, setOptimisticTxEdits] = useState<Record<string, Partial<Transaction>>>({});
+
+  // Listen for optimistic import events and update optimistic local state (so imported items appear immediately)
+  useEffect(() => {
+    const handler = (e: any) => {
+      try {
+        const detail = e.detail || {};
+        const createdStores: any[] = Array.isArray(detail.createdStores) ? detail.createdStores : [];
+        const createdTxs: any[] = Array.isArray(detail.createdTxs) ? detail.createdTxs : [];
+        if (createdStores.length) {
+          setOptimisticStores(prev => {
+            const seen = new Set(prev.map(s => s.id));
+            const additions = createdStores.filter(s => !seen.has(s.id)).map(s => ({ id: s.id, name: s.name || 'Untitled Store', owner: s.owner || 'N/A', email: s.email || 'N/A', location: s.location || 'Unknown', totalRevenue: s.totalRevenue || 0, entries: s.entries || 0, createdAt: s.createdAt }));
+            return [...prev, ...additions];
+          });
+          // Also merge directly into `stores` so view updates immediately even before snapshots reconcile
+          try {
+            setStores(prev => {
+              const seen = new Set(prev.map(s => s.id));
+              const additions = createdStores.filter(s => !seen.has(s.id)).map(s => ({ id: s.id, name: s.name || 'Untitled Store', owner: s.owner || 'N/A', email: s.email || 'N/A', location: s.location || 'Unknown', totalRevenue: s.totalRevenue || 0, entries: s.entries || 0, createdAt: s.createdAt }));
+              return [...prev, ...additions];
+            });
+          } catch (err) { console.warn('Failed merging createdStores into stores state:', err); }
+        }
+        if (createdTxs.length) {
+          setOptimisticTxs(prev => {
+            const additions = createdTxs.map((t: any) => ({ id: t.id, storeId: t.storeId, senderName: t.senderName || '', simCardsSold: t.simCardsSold || 0, faultySims: t.faultySims, paymentAmount: t.paymentAmount || 0, status: t.status || 'Completed', createdAt: t.createdAt || new Date().toISOString(), transactionMonth: t.transactionMonth || '', remark: t.remark || '', receiptCollectionDate: t.receiptCollectionDate, receipts: t.receipts || [], clearance: t.clearance } as Transaction));
+            return [...prev, ...additions];
+          });
+          // Also merge directly into `transactions` so they appear under stores immediately
+          try {
+            setTransactions(prev => {
+              const additions = createdTxs.map((t: any) => ({ id: t.id, storeId: t.storeId, senderName: t.senderName || '', simCardsSold: t.simCardsSold || 0, faultySims: t.faultySims, paymentAmount: t.paymentAmount || 0, status: t.status || 'Completed', createdAt: t.createdAt || new Date().toISOString(), transactionMonth: t.transactionMonth || '', remark: t.remark || '', receiptCollectionDate: t.receiptCollectionDate, receipts: t.receipts || [], clearance: t.clearance } as Transaction));
+              return [...prev, ...additions];
+            });
+          } catch (err) { console.warn('Failed merging createdTxs into transactions state:', err); }
+        }
+      } catch (err) {
+        console.error('importCreated handler failed:', err);
+      }
+    };
+    window.addEventListener('importCreated', handler as EventListener);
+    return () => window.removeEventListener('importCreated', handler as EventListener);
+  }, []);
 
   const getPendingStores = useCallback((): StoreData[] => {
     try {
@@ -2016,6 +2405,22 @@ const App: React.FC = () => {
           m[p.storeId].push(p);
         }
       }
+      // Merge optimistic transactions created during this session
+      for (const p of optimisticTxs) {
+        if (!m[p.storeId]) { m[p.storeId] = [p]; continue; }
+        const idIndex = m[p.storeId].findIndex(r => r.id === p.id);
+        if (idIndex >= 0) {
+          m[p.storeId][idIndex] = { ...m[p.storeId][idIndex], ...p };
+          continue;
+        }
+        const monthIndex = m[p.storeId].findIndex(r => r.transactionMonth === p.transactionMonth);
+        if (monthIndex >= 0) {
+          const remote = m[p.storeId][monthIndex];
+          m[p.storeId][monthIndex] = { ...remote, senderName: p.senderName, simCardsSold: p.simCardsSold, faultySims: p.faultySims ?? remote.faultySims, paymentAmount: p.paymentAmount, remark: p.remark, receiptCollectionDate: p.receiptCollectionDate ?? remote.receiptCollectionDate, clearance: p.clearance ?? remote.clearance };
+        } else {
+          m[p.storeId].push(p);
+        }
+      }
     } catch {/* ignore */}
     // Proper calendar month ordering
     const monthIndex: Record<string, number> = {
@@ -2036,7 +2441,7 @@ const App: React.FC = () => {
       m[key] = m[key].map(tx => optimisticTxEdits[tx.id] ? { ...tx, ...optimisticTxEdits[tx.id] } : tx);
     }
     return m;
-  }, [transactions, pendingPaymentsVersion, optimisticTxEdits]);
+  }, [transactions, pendingPaymentsVersion, optimisticTxEdits, optimisticTxs]);
 
   // Prune optimistic edits once snapshot reflects them (matching fields)
   useEffect(() => {
@@ -2170,7 +2575,7 @@ const App: React.FC = () => {
   }, [isAuthReady, db, appId]);
 
   const displayStores = useMemo(() => {
-    const merged = [...stores, ...getPendingStores()];
+    const merged = [...stores, ...getPendingStores(), ...optimisticStores];
     // De-duplicate by id (favor remote stores if IDs collide)
     const seen = new Set<string>();
     const out: StoreData[] = [];
@@ -2180,7 +2585,7 @@ const App: React.FC = () => {
       out.push(s);
     }
     return out;
-  }, [stores, getPendingStores, pendingVersion]);
+  }, [stores, getPendingStores, pendingVersion, optimisticStores]);
 
   const renderContent = useCallback(() => {
     switch (currentView) {
